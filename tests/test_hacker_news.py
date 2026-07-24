@@ -114,35 +114,90 @@ async def test_collect_hacker_news_falls_back_to_showstories_with_degraded_healt
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_collect_hacker_news_caps_results_and_deduplicates_repositories():
-    payload = fixture("hn_algolia.json")
-    payload["hits"] = [
-        payload["hits"][0],
-        payload["hits"][0] | {"objectID": "102"},
-        {
-            "objectID": "103",
-            "url": "https://github.com/Other/Project",
-            "story_text": None,
-        },
-    ]
+async def test_collect_hacker_news_verifies_later_hit_after_dead_same_repo_hit():
+    payload = {
+        "nbPages": 1,
+        "hits": [
+            {"objectID": "201", "url": "https://github.com/acme/tool"},
+            {"objectID": "202", "url": "https://github.com/acme/tool"},
+        ],
+    }
     respx.get(ALGOLIA_SEARCH_URL).mock(return_value=httpx.Response(200, json=payload))
-    first = respx.get(f"{FIREBASE_BASE_URL}/item/101.json").mock(
-        return_value=httpx.Response(200, json=fixture("hn_firebase_item.json"))
-    )
-    second = respx.get(f"{FIREBASE_BASE_URL}/item/103.json").mock(
+    dead = respx.get(f"{FIREBASE_BASE_URL}/item/201.json").mock(
         return_value=httpx.Response(
             200,
-            json=fixture("hn_firebase_item.json")
-            | {"id": 103, "url": "https://github.com/Other/Project"},
+            json={"id": 201, "type": "story", "dead": True, "url": "https://github.com/acme/tool"},
+        )
+    )
+    valid = respx.get(f"{FIREBASE_BASE_URL}/item/202.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": 202,
+                "type": "story",
+                "url": "https://github.com/acme/tool",
+                "score": 9,
+                "descendants": 3,
+            },
         )
     )
 
     async with httpx.AsyncClient() as client:
         result = await collect_hacker_news(client, OBSERVED_AT, lookback_hours=24, limit=1)
 
-    assert len(result.observations) == 1
-    assert first.called
-    assert not second.called
+    assert dead.called and valid.called
+    assert [item.source_metadata["item_id"] for item in result.observations] == [202]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_collect_hacker_news_keeps_distinct_submissions_without_crowding_out_repositories():
+    payload = {
+        "nbPages": 1,
+        "hits": [
+            {"objectID": "301", "url": "https://github.com/acme/tool"},
+            {"objectID": "302", "url": "https://github.com/acme/tool"},
+            {"objectID": "303", "url": "https://github.com/other/project"},
+        ],
+    }
+    respx.get(ALGOLIA_SEARCH_URL).mock(return_value=httpx.Response(200, json=payload))
+    for item_id, url in [(301, "acme/tool"), (302, "acme/tool"), (303, "other/project")]:
+        respx.get(f"{FIREBASE_BASE_URL}/item/{item_id}.json").mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": item_id, "type": "story", "url": f"https://github.com/{url}"},
+            )
+        )
+
+    async with httpx.AsyncClient() as client:
+        result = await collect_hacker_news(client, OBSERVED_AT, lookback_hours=24, limit=2)
+
+    assert [item.source_metadata["item_id"] for item in result.observations] == [301, 302, 303]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_collect_hacker_news_fetches_duplicate_object_id_and_repository_once():
+    payload = {
+        "nbPages": 1,
+        "hits": [
+            {"objectID": "401", "url": "https://github.com/acme/tool"},
+            {"objectID": "401", "url": "https://github.com/acme/tool"},
+        ],
+    }
+    respx.get(ALGOLIA_SEARCH_URL).mock(return_value=httpx.Response(200, json=payload))
+    item = respx.get(f"{FIREBASE_BASE_URL}/item/401.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": 401, "type": "story", "url": "https://github.com/acme/tool"},
+        )
+    )
+
+    async with httpx.AsyncClient() as client:
+        result = await collect_hacker_news(client, OBSERVED_AT, lookback_hours=24, limit=1)
+
+    assert item.call_count == 1
+    assert [observation.source_metadata["item_id"] for observation in result.observations] == [401]
 
 
 @pytest.mark.asyncio

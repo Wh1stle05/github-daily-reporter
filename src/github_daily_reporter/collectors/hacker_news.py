@@ -23,6 +23,8 @@ FIREBASE_BASE_URL = "https://hacker-news.firebaseio.com/v0"
 DEFAULT_MAX_RESPONSE_BYTES = 500_000
 DEFAULT_MAX_ATTEMPTS = 3
 MAX_ALGOLIA_PAGES = 10
+MAX_ALGOLIA_CANDIDATES = 1_000
+MAX_SHOWSTORIES_CANDIDATES = 500
 FIREBASE_FETCH_CONCURRENCY = 10
 RETRYABLE_STATUS = {429, 502, 503, 504}
 USER_AGENT = "github-daily-reporter/0.1"
@@ -110,7 +112,7 @@ async def collect_hacker_news(
     _validate_positive_int(limit, "limit")
 
     try:
-        candidates = await _algolia_candidates(client, observed_at_utc, lookback_hours, limit)
+        candidates = await _algolia_candidates(client, observed_at_utc, lookback_hours)
         observations = await _fetch_verified_candidates(client, candidates, observed_at_utc, limit)
     except (httpx.HTTPError, HackerNewsFetchError, HackerNewsResponseError) as error:
         observations = await collect_showstories_fallback(client, observed_at_utc, limit)
@@ -153,7 +155,7 @@ async def collect_showstories_fallback(
             continue
         seen_ids.add(item_id)
         candidates.append({"objectID": str(item_id)})
-        if len(candidates) >= limit:
+        if len(candidates) >= MAX_SHOWSTORIES_CANDIDATES:
             break
 
     observations: list[SourceObservation] = []
@@ -171,18 +173,17 @@ async def collect_showstories_fallback(
             observation = verified_observation(synthetic_hit, item, observed_at_utc)
             if observation is not None:
                 observations.append(observation)
-    return observations[:limit]
+    return _limit_unique_repositories(observations, limit)
 
 
 async def _algolia_candidates(
     client: httpx.AsyncClient,
     observed_at: datetime,
     lookback_hours: int,
-    limit: int,
 ) -> list[dict[str, Any]]:
     cutoff = int((observed_at - timedelta(hours=lookback_hours)).timestamp())
     candidates: list[dict[str, Any]] = []
-    seen_repositories: set[str] = set()
+    seen_pairs: set[tuple[int, str]] = set()
 
     for page in range(MAX_ALGOLIA_PAGES):
         params: dict[str, str | int] = {
@@ -196,15 +197,18 @@ async def _algolia_candidates(
         hits, page_count = _algolia_page(payload)
 
         for hit in hits:
-            if not isinstance(hit, dict) or _positive_id(hit.get("objectID")) is None:
+            if not isinstance(hit, dict):
+                continue
+            item_id = _positive_id(hit.get("objectID"))
+            if item_id is None:
                 continue
             for url in _urls_from_hit(hit):
                 ref = _strict_repo_ref(url)
-                if ref is None or ref.canonical_name in seen_repositories:
+                if ref is None or (item_id, ref.canonical_name) in seen_pairs:
                     continue
-                seen_repositories.add(ref.canonical_name)
+                seen_pairs.add((item_id, ref.canonical_name))
                 candidates.append(hit | {"url": _canonical_url(ref), "story_text": ""})
-                if len(candidates) >= limit:
+                if len(candidates) >= MAX_ALGOLIA_CANDIDATES:
                     return candidates
 
         if not hits or page + 1 >= page_count:
@@ -219,19 +223,19 @@ async def _fetch_verified_candidates(
     limit: int,
 ) -> list[SourceObservation]:
     observations: list[SourceObservation] = []
-    for batch in _batches(candidates, FIREBASE_FETCH_CONCURRENCY):
+    groups = _candidate_item_groups(candidates)
+    for batch in _batches(groups, FIREBASE_FETCH_CONCURRENCY):
         items = await asyncio.gather(
-            *(_fetch_json(client, f"{FIREBASE_BASE_URL}/item/{candidate['objectID']}.json") for candidate in batch)
+            *(_fetch_json(client, f"{FIREBASE_BASE_URL}/item/{group['objectID']}.json") for group in batch)
         )
-        for candidate, item in zip(batch, items, strict=True):
+        for group, item in zip(batch, items, strict=True):
             if not isinstance(item, dict):
                 continue
-            observation = verified_observation(candidate, item, observed_at)
-            if observation is not None:
-                observations.append(observation)
-                if len(observations) >= limit:
-                    return observations
-    return observations
+            for candidate in group["candidates"]:
+                observation = verified_observation(candidate, item, observed_at)
+                if observation is not None:
+                    observations.append(observation)
+    return _limit_unique_repositories(observations, limit)
 
 
 async def _fetch_json(
@@ -369,6 +373,35 @@ def _validate_positive_int(value: object, name: str) -> None:
 def _batches(values: list[dict[str, Any]], size: int) -> Iterable[list[dict[str, Any]]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def _candidate_item_groups(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group already-deduplicated repository targets so each Firebase item is fetched once."""
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        item_id = _positive_id(candidate.get("objectID"))
+        if item_id is not None:
+            groups.setdefault(item_id, []).append(candidate)
+    return [
+        {"objectID": str(item_id), "candidates": item_candidates}
+        for item_id, item_candidates in groups.items()
+    ]
+
+
+def _limit_unique_repositories(
+    observations: list[SourceObservation], limit: int
+) -> list[SourceObservation]:
+    """Keep all submissions for the first ``limit`` verified repository identities."""
+    retained: list[SourceObservation] = []
+    repositories: set[str] = set()
+    for observation in observations:
+        identity = f"{observation.owner}/{observation.name}".lower()
+        if identity not in repositories:
+            if len(repositories) >= limit:
+                continue
+            repositories.add(identity)
+        retained.append(observation)
+    return retained
 
 
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
