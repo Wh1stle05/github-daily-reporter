@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, SecretStr, model_validator
 class ReporterConfig(BaseModel):
     timezone: str
     github_token: SecretStr
+    project_root: Path | None = Field(default=None, exclude=True)
     new_repo_lookback_days: int = Field(default=7, ge=1, le=30)
     hn_lookback_hours: int = Field(default=24, ge=1, le=168)
     velocity_window_hours: int = Field(default=24, ge=1, le=168)
@@ -50,4 +51,5 @@ def load_config(path: Path) -> ReporterConfig:
     raw["state_db"] = (
         project_root / raw.get("state_db", "data/reporter.sqlite3")
     ).resolve()
+    raw["project_root"] = project_root
     return ReporterConfig.model_validate(raw)

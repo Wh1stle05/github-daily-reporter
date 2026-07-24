@@ -73,6 +73,21 @@ def test_save_collection_rolls_back_candidate_writes_on_invalid_observation(tmp_
     assert "owner/repo" not in store.recent_repository_names(datetime.now(UTC) - timedelta(days=1))
 
 
+def test_save_collection_transaction_rolls_back_snapshots_and_collection_on_invalid_observation(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = store.start_run(datetime.now(UTC))
+    bad = SourceObservation.model_construct(source="unknown")
+
+    with pytest.raises(Exception):
+        store.save_collection_transaction(run_id, [candidate()], [bad], datetime.now(UTC))
+
+    assert store.get_run_candidates(run_id) == []
+    assert "owner/repo" not in store.recent_repository_names(datetime.now(UTC) - timedelta(days=1))
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM repo_snapshots").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM source_hits").fetchone()[0] == 0
+
+
 def test_recent_repositories_respects_cutoff(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     now = datetime.now(UTC)

@@ -96,30 +96,21 @@ class StateStore:
     ) -> None:
         seen_at = _timestamp(datetime.now(UTC))
         with self._connection() as connection:
+            self._save_collection(connection, run_id, candidates, observations, seen_at)
+
+    def save_collection_transaction(
+        self,
+        run_id: str,
+        candidates: list[RepositoryCandidate],
+        observations: list[SourceObservation],
+        observed_at: datetime,
+    ) -> None:
+        """Atomically record snapshots and all collection records for one run."""
+        timestamp = _timestamp(observed_at)
+        with self._connection() as connection:
             for candidate in candidates:
-                connection.execute(
-                    "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
-                    "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
-                    "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
-                    (candidate.canonical_name, candidate.model_dump_json(), seen_at),
-                )
-                connection.execute(
-                    "INSERT INTO run_candidates (run_id, canonical_name, candidate_json) VALUES (?, ?, ?)",
-                    (run_id, candidate.canonical_name, candidate.model_dump_json()),
-                )
-            for observation in observations:
-                validated = SourceObservation.model_validate(observation.model_dump())
-                canonical_name = f"{validated.owner}/{validated.name}".lower()
-                connection.execute(
-                    "INSERT INTO source_hits (run_id, source, canonical_name, observation_json) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        run_id,
-                        validated.source,
-                        canonical_name,
-                        validated.model_dump_json(),
-                    ),
-                )
+                self._record_snapshot(connection, candidate, timestamp)
+            self._save_collection(connection, run_id, candidates, observations, timestamp)
 
     def finish_run(
         self,
@@ -161,24 +152,63 @@ class StateStore:
     def record_snapshot(self, candidate: RepositoryCandidate, observed_at: datetime) -> None:
         timestamp = _timestamp(observed_at)
         with self._connection() as connection:
+            self._record_snapshot(connection, candidate, timestamp)
+
+    @staticmethod
+    def _record_snapshot(
+        connection: sqlite3.Connection, candidate: RepositoryCandidate, timestamp: str
+    ) -> None:
+        connection.execute(
+            "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
+            "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
+            (candidate.canonical_name, candidate.model_dump_json(), timestamp),
+        )
+        connection.execute(
+            "INSERT INTO repo_snapshots "
+            "(canonical_name, observed_at, stars_total, forks_total, open_issues_count) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(canonical_name, observed_at) DO UPDATE SET "
+            "stars_total = excluded.stars_total, forks_total = excluded.forks_total, "
+            "open_issues_count = excluded.open_issues_count",
+            (
+                candidate.canonical_name,
+                timestamp,
+                candidate.stars_total,
+                candidate.forks_total,
+                candidate.open_issues_count,
+            ),
+        )
+
+    @staticmethod
+    def _save_collection(
+        connection: sqlite3.Connection,
+        run_id: str,
+        candidates: list[RepositoryCandidate],
+        observations: list[SourceObservation],
+        seen_at: str,
+    ) -> None:
+        for candidate in candidates:
             connection.execute(
                 "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
                 "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
                 "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
-                (candidate.canonical_name, candidate.model_dump_json(), timestamp),
+                (candidate.canonical_name, candidate.model_dump_json(), seen_at),
             )
             connection.execute(
-                "INSERT INTO repo_snapshots "
-                "(canonical_name, observed_at, stars_total, forks_total, open_issues_count) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(canonical_name, observed_at) DO UPDATE SET "
-                "stars_total = excluded.stars_total, forks_total = excluded.forks_total, "
-                "open_issues_count = excluded.open_issues_count",
+                "INSERT INTO run_candidates (run_id, canonical_name, candidate_json) VALUES (?, ?, ?)",
+                (run_id, candidate.canonical_name, candidate.model_dump_json()),
+            )
+        for observation in observations:
+            validated = SourceObservation.model_validate(observation.model_dump())
+            canonical_name = f"{validated.owner}/{validated.name}".lower()
+            connection.execute(
+                "INSERT INTO source_hits (run_id, source, canonical_name, observation_json) "
+                "VALUES (?, ?, ?, ?)",
                 (
-                    candidate.canonical_name,
-                    timestamp,
-                    candidate.stars_total,
-                    candidate.forks_total,
-                    candidate.open_issues_count,
+                    run_id,
+                    validated.source,
+                    canonical_name,
+                    validated.model_dump_json(),
                 ),
             )
 
