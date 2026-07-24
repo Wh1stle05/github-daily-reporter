@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -11,6 +11,7 @@ from github_daily_reporter.collectors.hacker_news import (
     FIREBASE_BASE_URL,
     HackerNewsFetchError,
     collect_hacker_news,
+    collect_showstories_fallback,
     extract_github_urls,
     verified_observation,
 )
@@ -37,6 +38,20 @@ def test_extract_github_urls_strips_html_and_keeps_first_valid_repository_identi
     ]
 
 
+def test_extract_github_urls_keeps_valid_anchor_targets_in_document_order():
+    urls = extract_github_urls(
+        '<p>https://github.com/Visible/Repo <a href="https://github.com/Linked/Project.git">'
+        "project</a> <a href=\"https://github.com/Linked/Project/issues/1\">bad</a>"
+        '<a href="javascript:alert(1)">also bad</a></p>'
+    )
+
+    assert urls == ["https://github.com/Visible/Repo", "https://github.com/Linked/Project"]
+
+
+def test_extract_github_urls_ignores_urls_in_html_comments():
+    assert extract_github_urls("<!-- https://github.com/Hidden/Project --><p>no link</p>") == []
+
+
 @pytest.mark.parametrize(
     "item",
     [
@@ -49,19 +64,19 @@ def test_extract_github_urls_strips_html_and_keeps_first_valid_repository_identi
 def test_verified_observation_rejects_dead_deleted_and_non_story_items(item: dict):
     hit = fixture("hn_algolia.json")["hits"][0]
 
-    assert verified_observation(hit, item, OBSERVED_AT) is None
+    assert verified_observation(hit, item, OBSERVED_AT) == []
 
 
 def test_verified_observation_uses_official_firebase_metrics_not_algolia_values():
-    observation = verified_observation(
+    observations = verified_observation(
         fixture("hn_algolia.json")["hits"][0],
         fixture("hn_firebase_item.json"),
         OBSERVED_AT,
     )
 
-    assert observation is not None
-    assert observation.repository_url == "https://github.com/Example-Org/First-Repo"
-    assert observation.source_metadata == {"item_id": 101, "points": 42, "comments": 11}
+    assert len(observations) == 1
+    assert observations[0].repository_url == "https://github.com/Example-Org/First-Repo"
+    assert observations[0].source_metadata == {"item_id": 101, "points": 42, "comments": 11}
 
 
 def test_verified_observation_rejects_id_mismatch_and_unverified_repository_reference():
@@ -69,8 +84,35 @@ def test_verified_observation_rejects_id_mismatch_and_unverified_repository_refe
     mismatched = fixture("hn_firebase_item.json") | {"id": 102}
     unrelated = fixture("hn_firebase_item.json") | {"url": "https://github.com/Other/Project"}
 
-    assert verified_observation(hit, mismatched, OBSERVED_AT) is None
-    assert verified_observation(hit, unrelated, OBSERVED_AT) is None
+    assert verified_observation(hit, mismatched, OBSERVED_AT) == []
+    assert verified_observation(hit, unrelated, OBSERVED_AT) == []
+
+
+def test_verified_observation_returns_every_repository_in_deterministic_order():
+    hit = {
+        "objectID": "105",
+        "url": "https://github.com/Acme/Tool",
+        "story_text": "and https://github.com/Other/Project",
+    }
+    item = {
+        "id": 105,
+        "type": "story",
+        "url": "https://github.com/Acme/Tool",
+        "text": "and https://github.com/Other/Project",
+        "score": 7,
+        "descendants": 4,
+    }
+
+    observations = verified_observation(hit, item, OBSERVED_AT)
+
+    assert [observation.repository_url for observation in observations] == [
+        "https://github.com/Acme/Tool",
+        "https://github.com/Other/Project",
+    ]
+    assert [observation.source_metadata for observation in observations] == [
+        {"item_id": 105, "points": 7, "comments": 4},
+        {"item_id": 105, "points": 7, "comments": 4},
+    ]
 
 
 @pytest.mark.asyncio
@@ -94,6 +136,38 @@ async def test_collect_hacker_news_verifies_algolia_hits_against_firebase():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_collect_hacker_news_keeps_both_repositories_from_one_verified_story():
+    payload = {
+        "nbPages": 1,
+        "hits": [
+            {
+                "objectID": "106",
+                "story_text": "https://github.com/Acme/Tool and https://github.com/Other/Project",
+            }
+        ],
+    }
+    item = {
+        "id": 106,
+        "type": "story",
+        "text": "https://github.com/Acme/Tool and https://github.com/Other/Project",
+    }
+    respx.get(ALGOLIA_SEARCH_URL).mock(return_value=httpx.Response(200, json=payload))
+    firebase = respx.get(f"{FIREBASE_BASE_URL}/item/106.json").mock(
+        return_value=httpx.Response(200, json=item)
+    )
+
+    async with httpx.AsyncClient() as client:
+        result = await collect_hacker_news(client, OBSERVED_AT, lookback_hours=24, limit=2)
+
+    assert firebase.call_count == 1
+    assert [observation.repository_url for observation in result.observations] == [
+        "https://github.com/Acme/Tool",
+        "https://github.com/Other/Project",
+    ]
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_collect_hacker_news_falls_back_to_showstories_with_degraded_health():
     respx.get(ALGOLIA_SEARCH_URL).mock(return_value=httpx.Response(503))
     showstories = respx.get(f"{FIREBASE_BASE_URL}/showstories.json").mock(
@@ -110,6 +184,99 @@ async def test_collect_hacker_news_falls_back_to_showstories_with_degraded_healt
     assert len(result.observations) == 1
     assert result.health.status == "degraded"
     assert "narrower coverage" in (result.health.error or "")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_showstories_fallback_keeps_two_repositories_from_one_recent_story():
+    observed_timestamp = int(OBSERVED_AT.timestamp())
+    respx.get(f"{FIREBASE_BASE_URL}/showstories.json").mock(return_value=httpx.Response(200, json=[107]))
+    respx.get(f"{FIREBASE_BASE_URL}/item/107.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": 107,
+                "type": "story",
+                "time": observed_timestamp,
+                "text": "https://github.com/Acme/Tool and https://github.com/Other/Project",
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as client:
+        observations = await collect_showstories_fallback(
+            client, OBSERVED_AT, limit=2, lookback_hours=24
+        )
+
+    assert [observation.repository_url for observation in observations] == [
+        "https://github.com/Acme/Tool",
+        "https://github.com/Other/Project",
+    ]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_showstories_fallback_skips_old_items_and_keeps_cutoff_boundary():
+    cutoff = int((OBSERVED_AT - timedelta(hours=24)).timestamp())
+    respx.get(f"{FIREBASE_BASE_URL}/showstories.json").mock(return_value=httpx.Response(200, json=[108, 109]))
+    respx.get(f"{FIREBASE_BASE_URL}/item/108.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": 108,
+                "type": "story",
+                "time": cutoff - 1,
+                "url": "https://github.com/Old/Project",
+            },
+        )
+    )
+    respx.get(f"{FIREBASE_BASE_URL}/item/109.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": 109,
+                "type": "story",
+                "time": cutoff,
+                "url": "https://github.com/Current/Project",
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as client:
+        observations = await collect_showstories_fallback(
+            client, OBSERVED_AT, limit=2, lookback_hours=24
+        )
+
+    assert [observation.repository_url for observation in observations] == [
+        "https://github.com/Current/Project"
+    ]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_collect_hacker_news_skips_oversized_algolia_ids_without_raw_value_errors():
+    respx.get(ALGOLIA_SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"nbPages": 1, "hits": [{"objectID": "9" * 10_000}]})
+    )
+
+    async with httpx.AsyncClient() as client:
+        result = await collect_hacker_news(client, OBSERVED_AT, lookback_hours=24, limit=1)
+
+    assert result.observations == []
+    assert result.health.status == "success"
+
+
+def test_verified_observation_rejects_oversized_numeric_firebase_ids():
+    oversized_id = 10**30
+
+    assert (
+        verified_observation(
+            {"objectID": oversized_id, "url": "https://github.com/Acme/Tool"},
+            {"id": oversized_id, "type": "story", "url": "https://github.com/Acme/Tool"},
+            OBSERVED_AT,
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio

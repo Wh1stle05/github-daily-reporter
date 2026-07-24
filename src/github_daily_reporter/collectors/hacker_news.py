@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import warnings
 
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+from bs4.element import Comment, NavigableString, Tag
 import httpx
 
 from github_daily_reporter.models import CollectorResult, RepoRef, SourceHealth, SourceObservation
@@ -25,6 +26,8 @@ DEFAULT_MAX_ATTEMPTS = 3
 MAX_ALGOLIA_PAGES = 10
 MAX_ALGOLIA_CANDIDATES = 1_000
 MAX_SHOWSTORIES_CANDIDATES = 500
+MAX_ASCII_INTEGER_DIGITS = 20
+MAX_ASCII_INTEGER_VALUE = 10**MAX_ASCII_INTEGER_DIGITS - 1
 FIREBASE_FETCH_CONCURRENCY = 10
 RETRYABLE_STATUS = {429, 502, 503, 504}
 USER_AGENT = "github-daily-reporter/0.1"
@@ -44,26 +47,44 @@ def extract_github_urls(text: str) -> list[str]:
     if not isinstance(text, str):
         return []
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", MarkupResemblesLocatorWarning)
-        plain_text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
     urls: list[str] = []
     seen: set[str] = set()
-    for match in _GITHUB_URL_PATTERN.finditer(plain_text):
-        ref = _strict_repo_ref(match.group().rstrip(".,;:!?)]}"))
+
+    def append(url: str) -> None:
+        ref = _strict_repo_ref(url.rstrip(".,;:!?)]}"))
         if ref is None or ref.canonical_name in seen:
-            continue
+            return
         seen.add(ref.canonical_name)
         urls.append(_canonical_url(ref))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", MarkupResemblesLocatorWarning)
+        soup = BeautifulSoup(text, "html.parser")
+    for node in soup.descendants:
+        if isinstance(node, Tag) and node.name == "a":
+            href = node.get("href")
+            if isinstance(href, str):
+                append(href)
+        elif (
+            isinstance(node, NavigableString)
+            and not isinstance(node, Comment)
+            and node.parent
+            and node.parent.name not in {
+                "script",
+                "style",
+            }
+        ):
+            for match in _GITHUB_URL_PATTERN.finditer(str(node)):
+                append(match.group())
     return urls
 
 
 def verified_observation(
     hit: dict[str, Any], item: dict[str, Any], observed_at: datetime
-) -> SourceObservation | None:
+) -> list[SourceObservation]:
     """Turn an Algolia hit into an observation only after Firebase verification."""
     if not isinstance(hit, dict) or not isinstance(item, dict):
-        return None
+        return []
     item_id = _positive_id(item.get("id"))
     if (
         item_id is None
@@ -72,7 +93,7 @@ def verified_observation(
         or bool(item.get("dead"))
         or bool(item.get("deleted"))
     ):
-        return None
+        return []
 
     discovered = _urls_from_hit(hit)
     official = _urls_from_item(item)
@@ -81,23 +102,26 @@ def verified_observation(
         for url in official
         if (ref := _strict_repo_ref(url)) is not None
     }
+    observations: list[SourceObservation] = []
     for url in discovered:
         ref = _strict_repo_ref(url)
         if ref is None or ref.canonical_name not in official_refs:
             continue
-        return SourceObservation(
-            source="hacker_news",
-            repository_url=_canonical_url(ref),
-            owner=ref.owner,
-            name=ref.name,
-            observed_at=_normalize_utc(observed_at),
-            source_metadata={
-                "item_id": item_id,
-                "points": _nonnegative_metric(item.get("score")),
-                "comments": _nonnegative_metric(item.get("descendants")),
-            },
+        observations.append(
+            SourceObservation(
+                source="hacker_news",
+                repository_url=_canonical_url(ref),
+                owner=ref.owner,
+                name=ref.name,
+                observed_at=_normalize_utc(observed_at),
+                source_metadata={
+                    "item_id": item_id,
+                    "points": _nonnegative_metric(item.get("score")),
+                    "comments": _nonnegative_metric(item.get("descendants")),
+                },
+            )
         )
-    return None
+    return observations
 
 
 async def collect_hacker_news(
@@ -115,7 +139,9 @@ async def collect_hacker_news(
         candidates = await _algolia_candidates(client, observed_at_utc, lookback_hours)
         observations = await _fetch_verified_candidates(client, candidates, observed_at_utc, limit)
     except (httpx.HTTPError, HackerNewsFetchError, HackerNewsResponseError) as error:
-        observations = await collect_showstories_fallback(client, observed_at_utc, limit)
+        observations = await collect_showstories_fallback(
+            client, observed_at_utc, limit, lookback_hours=lookback_hours
+        )
         return CollectorResult(
             source="hacker_news",
             observations=observations,
@@ -138,11 +164,17 @@ async def collect_hacker_news(
 
 
 async def collect_showstories_fallback(
-    client: httpx.AsyncClient, observed_at: datetime, limit: int
+    client: httpx.AsyncClient,
+    observed_at: datetime,
+    limit: int,
+    *,
+    lookback_hours: int = 24,
 ) -> list[SourceObservation]:
     """Collect the current Firebase Show HN listing when Algolia is unavailable."""
     observed_at_utc = _normalize_utc(observed_at)
     _validate_positive_int(limit, "limit")
+    _validate_positive_int(lookback_hours, "lookback_hours")
+    cutoff = int((observed_at_utc - timedelta(hours=lookback_hours)).timestamp())
     payload = await _fetch_json(client, f"{FIREBASE_BASE_URL}/showstories.json")
     if not isinstance(payload, list):
         raise HackerNewsResponseError("Firebase showstories response was not a list")
@@ -164,15 +196,13 @@ async def collect_showstories_fallback(
             *(_fetch_json(client, f"{FIREBASE_BASE_URL}/item/{candidate['objectID']}.json") for candidate in batch)
         )
         for candidate, item in zip(batch, items, strict=True):
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or not _is_recent_item(item, cutoff):
                 continue
             synthetic_hit = candidate | {
                 "url": item.get("url"),
                 "story_text": item.get("text"),
             }
-            observation = verified_observation(synthetic_hit, item, observed_at_utc)
-            if observation is not None:
-                observations.append(observation)
+            observations.extend(verified_observation(synthetic_hit, item, observed_at_utc))
     return _limit_unique_repositories(observations, limit)
 
 
@@ -232,9 +262,7 @@ async def _fetch_verified_candidates(
             if not isinstance(item, dict):
                 continue
             for candidate in group["candidates"]:
-                observation = verified_observation(candidate, item, observed_at)
-                if observation is not None:
-                    observations.append(observation)
+                observations.extend(verified_observation(candidate, item, observed_at))
     return _limit_unique_repositories(observations, limit)
 
 
@@ -277,7 +305,7 @@ async def _read_response_bytes(response: httpx.Response) -> bytes:
 def _decode_json(data: bytes) -> Any:
     try:
         return json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, ValueError) as error:
         raise HackerNewsResponseError("Hacker News response was not valid JSON") from error
 
 
@@ -343,14 +371,29 @@ def _canonical_url(ref: RepoRef) -> str:
 
 
 def _positive_id(value: object) -> int | None:
+    return _ascii_integer(value, minimum=1)
+
+
+def _timestamp(value: object) -> int | None:
+    return _ascii_integer(value, minimum=0)
+
+
+def _ascii_integer(value: object, *, minimum: int) -> int | None:
+    """Parse bounded ASCII decimal values without delegating unbounded input to ``int``."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, str) and value.isascii() and value.isdecimal():
-        parsed = int(value)
-        return parsed if parsed > 0 else None
-    return None
+        return value if minimum <= value <= MAX_ASCII_INTEGER_VALUE else None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_ASCII_INTEGER_DIGITS
+        or not value.isascii()
+        or not value.isdecimal()
+    ):
+        return None
+    parsed = int(value)
+    return parsed if parsed >= minimum else None
 
 
 def _nonnegative_metric(value: object) -> int:
@@ -386,6 +429,11 @@ def _candidate_item_groups(candidates: list[dict[str, Any]]) -> list[dict[str, A
         {"objectID": str(item_id), "candidates": item_candidates}
         for item_id, item_candidates in groups.items()
     ]
+
+
+def _is_recent_item(item: dict[str, Any], cutoff: int) -> bool:
+    item_time = _timestamp(item.get("time"))
+    return item_time is not None and item_time >= cutoff
 
 
 def _limit_unique_repositories(
