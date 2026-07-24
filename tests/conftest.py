@@ -89,9 +89,7 @@ class EndToEndHarness:
         *,
         failing_sources: set[str] | None = None,
         graphql_failure: bool = False,
-        no_snapshot: bool = False,
     ) -> CollectionEnvelope:
-        del no_snapshot  # Every run uses a new temporary state database unless a test reuses this harness.
         self._install_responses(failing_sources or set(), graphql_failure)
         config = load_config(self.config_path)
         store = StateStore(config.state_db)
@@ -129,7 +127,7 @@ class EndToEndHarness:
         )
 
     def _install_responses(self, failing_sources: set[str], graphql_failure: bool) -> None:
-        self.respx_mock.reset()
+        self.respx_mock.clear()
         payload = json.loads((self.fixture_root / "collection_success.json").read_text(encoding="utf-8"))
         status = 404
         self.respx_mock.get("https://github.com/trending").respond(
