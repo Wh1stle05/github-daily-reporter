@@ -1,0 +1,12 @@
+{
+  "hits": [
+    {
+      "objectID": "101",
+      "url": "https://github.com/Example-Org/First-Repo.git",
+      "story_text": "<p>Show HN: a <strong>useful</strong> project.</p>",
+      "points": 999,
+      "num_comments": 888
+    }
+  ],
+  "nbPages": 1
+}

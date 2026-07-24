@@ -1,0 +1,383 @@
+"""Verified Show HN repository discovery."""
+
+import asyncio
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
+import json
+import math
+import random
+import re
+from typing import Any
+from urllib.parse import urlparse
+import warnings
+
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+import httpx
+
+from github_daily_reporter.models import CollectorResult, RepoRef, SourceHealth, SourceObservation
+from github_daily_reporter.normalize import extract_repo_ref
+
+
+ALGOLIA_SEARCH_URL = "https://hn.algolia.com/api/v1/search_by_date"
+FIREBASE_BASE_URL = "https://hacker-news.firebaseio.com/v0"
+DEFAULT_MAX_RESPONSE_BYTES = 500_000
+DEFAULT_MAX_ATTEMPTS = 3
+MAX_ALGOLIA_PAGES = 10
+FIREBASE_FETCH_CONCURRENCY = 10
+RETRYABLE_STATUS = {429, 502, 503, 504}
+USER_AGENT = "github-daily-reporter/0.1"
+_GITHUB_URL_PATTERN = re.compile(r"https://(?:www\.)?github\.com/[^\s<>\"']+", re.IGNORECASE)
+
+
+class HackerNewsResponseError(ValueError):
+    """A Hacker News API response did not have the expected shape."""
+
+
+class HackerNewsFetchError(RuntimeError):
+    """A Hacker News API response could not be fetched safely."""
+
+
+def extract_github_urls(text: str) -> list[str]:
+    """Extract first-seen canonical repository URLs from HTML or plain text."""
+    if not isinstance(text, str):
+        return []
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", MarkupResemblesLocatorWarning)
+        plain_text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _GITHUB_URL_PATTERN.finditer(plain_text):
+        ref = _strict_repo_ref(match.group().rstrip(".,;:!?)]}"))
+        if ref is None or ref.canonical_name in seen:
+            continue
+        seen.add(ref.canonical_name)
+        urls.append(_canonical_url(ref))
+    return urls
+
+
+def verified_observation(
+    hit: dict[str, Any], item: dict[str, Any], observed_at: datetime
+) -> SourceObservation | None:
+    """Turn an Algolia hit into an observation only after Firebase verification."""
+    if not isinstance(hit, dict) or not isinstance(item, dict):
+        return None
+    item_id = _positive_id(item.get("id"))
+    if (
+        item_id is None
+        or _positive_id(hit.get("objectID")) != item_id
+        or item.get("type") != "story"
+        or bool(item.get("dead"))
+        or bool(item.get("deleted"))
+    ):
+        return None
+
+    discovered = _urls_from_hit(hit)
+    official = _urls_from_item(item)
+    official_refs = {
+        ref.canonical_name
+        for url in official
+        if (ref := _strict_repo_ref(url)) is not None
+    }
+    for url in discovered:
+        ref = _strict_repo_ref(url)
+        if ref is None or ref.canonical_name not in official_refs:
+            continue
+        return SourceObservation(
+            source="hacker_news",
+            repository_url=_canonical_url(ref),
+            owner=ref.owner,
+            name=ref.name,
+            observed_at=_normalize_utc(observed_at),
+            source_metadata={
+                "item_id": item_id,
+                "points": _nonnegative_metric(item.get("score")),
+                "comments": _nonnegative_metric(item.get("descendants")),
+            },
+        )
+    return None
+
+
+async def collect_hacker_news(
+    client: httpx.AsyncClient,
+    observed_at: datetime,
+    lookback_hours: int,
+    limit: int,
+) -> CollectorResult:
+    """Collect recently posted Show HN repositories, verified from Firebase."""
+    observed_at_utc = _normalize_utc(observed_at)
+    _validate_positive_int(lookback_hours, "lookback_hours")
+    _validate_positive_int(limit, "limit")
+
+    try:
+        candidates = await _algolia_candidates(client, observed_at_utc, lookback_hours, limit)
+        observations = await _fetch_verified_candidates(client, candidates, observed_at_utc, limit)
+    except (httpx.HTTPError, HackerNewsFetchError, HackerNewsResponseError) as error:
+        observations = await collect_showstories_fallback(client, observed_at_utc, limit)
+        return CollectorResult(
+            source="hacker_news",
+            observations=observations,
+            health=SourceHealth(
+                source="hacker_news",
+                status="degraded",
+                item_count=len(observations),
+                error=(
+                    "Algolia Show HN search failed; Firebase showstories fallback has "
+                    f"narrower coverage ({type(error).__name__})"
+                ),
+            ),
+        )
+
+    return CollectorResult(
+        source="hacker_news",
+        observations=observations,
+        health=SourceHealth(source="hacker_news", status="success", item_count=len(observations)),
+    )
+
+
+async def collect_showstories_fallback(
+    client: httpx.AsyncClient, observed_at: datetime, limit: int
+) -> list[SourceObservation]:
+    """Collect the current Firebase Show HN listing when Algolia is unavailable."""
+    observed_at_utc = _normalize_utc(observed_at)
+    _validate_positive_int(limit, "limit")
+    payload = await _fetch_json(client, f"{FIREBASE_BASE_URL}/showstories.json")
+    if not isinstance(payload, list):
+        raise HackerNewsResponseError("Firebase showstories response was not a list")
+
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for value in payload:
+        item_id = _positive_id(value)
+        if item_id is None or item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        candidates.append({"objectID": str(item_id)})
+        if len(candidates) >= limit:
+            break
+
+    observations: list[SourceObservation] = []
+    for batch in _batches(candidates, FIREBASE_FETCH_CONCURRENCY):
+        items = await asyncio.gather(
+            *(_fetch_json(client, f"{FIREBASE_BASE_URL}/item/{candidate['objectID']}.json") for candidate in batch)
+        )
+        for candidate, item in zip(batch, items, strict=True):
+            if not isinstance(item, dict):
+                continue
+            synthetic_hit = candidate | {
+                "url": item.get("url"),
+                "story_text": item.get("text"),
+            }
+            observation = verified_observation(synthetic_hit, item, observed_at_utc)
+            if observation is not None:
+                observations.append(observation)
+    return observations[:limit]
+
+
+async def _algolia_candidates(
+    client: httpx.AsyncClient,
+    observed_at: datetime,
+    lookback_hours: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    cutoff = int((observed_at - timedelta(hours=lookback_hours)).timestamp())
+    candidates: list[dict[str, Any]] = []
+    seen_repositories: set[str] = set()
+
+    for page in range(MAX_ALGOLIA_PAGES):
+        params: dict[str, str | int] = {
+            "tags": "show_hn",
+            "numericFilters": f"created_at_i>{cutoff}",
+            "hitsPerPage": 100,
+        }
+        if page:
+            params["page"] = page
+        payload = await _fetch_json(client, ALGOLIA_SEARCH_URL, params=params)
+        hits, page_count = _algolia_page(payload)
+
+        for hit in hits:
+            if not isinstance(hit, dict) or _positive_id(hit.get("objectID")) is None:
+                continue
+            for url in _urls_from_hit(hit):
+                ref = _strict_repo_ref(url)
+                if ref is None or ref.canonical_name in seen_repositories:
+                    continue
+                seen_repositories.add(ref.canonical_name)
+                candidates.append(hit | {"url": _canonical_url(ref), "story_text": ""})
+                if len(candidates) >= limit:
+                    return candidates
+
+        if not hits or page + 1 >= page_count:
+            break
+    return candidates
+
+
+async def _fetch_verified_candidates(
+    client: httpx.AsyncClient,
+    candidates: list[dict[str, Any]],
+    observed_at: datetime,
+    limit: int,
+) -> list[SourceObservation]:
+    observations: list[SourceObservation] = []
+    for batch in _batches(candidates, FIREBASE_FETCH_CONCURRENCY):
+        items = await asyncio.gather(
+            *(_fetch_json(client, f"{FIREBASE_BASE_URL}/item/{candidate['objectID']}.json") for candidate in batch)
+        )
+        for candidate, item in zip(batch, items, strict=True):
+            if not isinstance(item, dict):
+                continue
+            observation = verified_observation(candidate, item, observed_at)
+            if observation is not None:
+                observations.append(observation)
+                if len(observations) >= limit:
+                    return observations
+    return observations
+
+
+async def _fetch_json(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, str | int] | None = None,
+) -> Any:
+    for attempt in range(1, DEFAULT_MAX_ATTEMPTS + 1):
+        try:
+            async with client.stream(
+                "GET", url, params=params, headers={"User-Agent": USER_AGENT}, timeout=20
+            ) as response:
+                if response.status_code not in RETRYABLE_STATUS:
+                    response.raise_for_status()
+                    return _decode_json(await _read_response_bytes(response))
+                if attempt == DEFAULT_MAX_ATTEMPTS:
+                    response.raise_for_status()
+                delay = _retry_delay(response, attempt)
+        except httpx.TransportError:
+            if attempt == DEFAULT_MAX_ATTEMPTS:
+                raise
+            delay = min(2 ** (attempt - 1) + random.uniform(0, 0.25), 10.0)
+        await asyncio.sleep(delay)
+    raise RuntimeError("unreachable")
+
+
+async def _read_response_bytes(response: httpx.Response) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > DEFAULT_MAX_RESPONSE_BYTES:
+            raise HackerNewsFetchError("Hacker News response exceeded maximum size")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_json(data: bytes) -> Any:
+    try:
+        return json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HackerNewsResponseError("Hacker News response was not valid JSON") from error
+
+
+def _algolia_page(payload: Any) -> tuple[list[Any], int]:
+    if not isinstance(payload, dict):
+        raise HackerNewsResponseError("Algolia Show HN response was not an object")
+    hits = payload.get("hits")
+    pages = payload.get("nbPages")
+    if (
+        not isinstance(hits, list)
+        or isinstance(pages, bool)
+        or not isinstance(pages, int)
+        or pages < 0
+    ):
+        raise HackerNewsResponseError("Algolia Show HN response had an invalid page shape")
+    return hits, pages
+
+
+def _urls_from_hit(hit: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    if isinstance(hit.get("url"), str):
+        urls.extend(extract_github_urls(hit["url"]))
+    if isinstance(hit.get("story_text"), str):
+        urls.extend(extract_github_urls(hit["story_text"]))
+    return _deduplicated_urls(urls)
+
+
+def _urls_from_item(item: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    if isinstance(item.get("url"), str):
+        urls.extend(extract_github_urls(item["url"]))
+    if isinstance(item.get("text"), str):
+        urls.extend(extract_github_urls(item["text"]))
+    return _deduplicated_urls(urls)
+
+
+def _deduplicated_urls(urls: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        ref = _strict_repo_ref(url)
+        if ref is None or ref.canonical_name in seen:
+            continue
+        seen.add(ref.canonical_name)
+        result.append(_canonical_url(ref))
+    return result
+
+
+def _strict_repo_ref(url: str) -> RepoRef | None:
+    """Validate a URL as exactly an owner/repository path before normalizing it."""
+    try:
+        path = urlparse(url).path.strip("/")
+    except ValueError:
+        return None
+    segments = path.split("/")
+    if len(segments) != 2 or not all(segments):
+        return None
+    return extract_repo_ref(url)
+
+
+def _canonical_url(ref: RepoRef) -> str:
+    return f"https://github.com/{ref.owner}/{ref.name}"
+
+
+def _positive_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _nonnegative_metric(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _normalize_utc(value: datetime) -> datetime:
+    if value.utcoffset() is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _validate_positive_int(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+def _batches(values: list[dict[str, Any]], size: int) -> Iterable[list[dict[str, Any]]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            delay = -1
+        if math.isfinite(delay) and delay >= 0:
+            return min(delay, 60.0)
+    return min(2 ** (attempt - 1) + random.uniform(0, 0.25), 10.0)
