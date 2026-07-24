@@ -1,4 +1,7 @@
 from datetime import UTC, datetime
+from itertools import permutations
+
+import pytest
 
 from github_daily_reporter.models import SourceObservation
 from github_daily_reporter.normalize import extract_repo_ref, merge_observations
@@ -9,7 +12,7 @@ def observation(
     owner: str = "Owner",
     name: str = "Repo",
     source_rank: int | None = None,
-    **source_metadata: int,
+    **source_metadata: object,
 ) -> SourceObservation:
     return SourceObservation(
         source=source,  # type: ignore[arg-type]
@@ -47,6 +50,77 @@ def test_extract_repo_ref_rejects_non_github_hosts() -> None:
     assert extract_repo_ref("https://example.com/Owner/Repo") is None
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://github.com/Owner/Repo",
+        "//github.com/Owner/Repo",
+        "https://user:secret@github.com/Owner/Repo",
+        "https://github.com:444/Owner/Repo",
+        "https://github.com:invalid/Owner/Repo",
+        "https://github.com:99999/Owner/Repo",
+        "https://[invalid/Owner/Repo",
+    ],
+)
+def test_extract_repo_ref_rejects_unsafe_or_invalid_authorities(url: str) -> None:
+    assert extract_repo_ref(url) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/Owner%2FTeam/Repo",
+        "https://github.com/Owner/Repo%5Cname",
+        "https://github.com/Owner/%00Repo",
+        "https://github.com/Owner/%252FRepo",
+        "https://github.com/./Repo",
+        "https://github.com/Owner/..",
+        "https://github.com/Owner!/Repo",
+    ],
+)
+def test_extract_repo_ref_rejects_encoded_or_invalid_identity_segments(url: str) -> None:
+    assert extract_repo_ref(url) is None
+
+
+def test_extract_repo_ref_decodes_once_and_normalizes_encoded_git_suffix() -> None:
+    repo = extract_repo_ref("https://github.com/Owner/Repo%2EGiT")
+
+    assert repo is not None
+    assert repo.owner == "Owner"
+    assert repo.name == "Repo"
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "about",
+        "apps",
+        "collections",
+        "enterprise",
+        "events",
+        "features",
+        "marketplace",
+        "orgs",
+        "settings",
+        "sponsors",
+        "topics",
+        "login",
+        "logout",
+        "join",
+        "new",
+        "notifications",
+        "dashboard",
+        "explore",
+        "search",
+        "site",
+        "organizations",
+        "users",
+    ],
+)
+def test_extract_repo_ref_rejects_reserved_github_routes(route: str) -> None:
+    assert extract_repo_ref(f"https://github.com/{route}/project") is None
+
+
 def test_merge_observations_combines_trending_and_hn_signals_by_identity() -> None:
     merged = merge_observations(
         [
@@ -82,3 +156,28 @@ def test_merge_observations_records_github_search_rank() -> None:
     merged = merge_observations([observation("github_search", source_rank=3)])
 
     assert merged["owner/repo"]["search_rank"] == 3
+
+
+def test_merge_observations_is_order_independent_for_duplicate_signals() -> None:
+    observations = [
+        observation("trending", source_rank=3, stars_today=50),
+        observation("trending", source_rank=1, stars_today=10),
+        observation("trending", source_rank=1, stars_today=20),
+        observation("github_search", source_rank=4),
+        observation("github_search", source_rank=2),
+        observation("hacker_news", points="7", comments=None, item_id=9),
+        observation("hacker_news", points=True, comments=-2, item_id=3),
+        observation("hacker_news", points="invalid", comments="11", item_id=9),
+    ]
+    expected = {
+        "discovery_sources": {"trending", "github_search", "hacker_news"},
+        "hn_item_ids": [3, 9],
+        "hn_points": 7,
+        "hn_comments": 11,
+        "trending_rank": 1,
+        "trending_stars_today": 20,
+        "search_rank": 2,
+    }
+
+    for ordered_observations in permutations(observations):
+        assert merge_observations(ordered_observations)["owner/repo"] == expected
