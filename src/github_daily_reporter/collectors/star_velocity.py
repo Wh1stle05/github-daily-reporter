@@ -76,12 +76,14 @@ async def enrich_velocity(
         estimate = _snapshot_estimate(candidate, cutoff, now_utc, snapshot_estimator)
         if estimate is None:
             _clear_velocity(candidate)
-            candidate.source_errors.append(VELOCITY_ERROR)
+            _record_velocity_error(candidate)
             return candidate
         _set_velocity(candidate, estimate, threshold, estimated=True)
+        _clear_velocity_error(candidate)
         return candidate
 
     _set_velocity(candidate, count, threshold, estimated=False)
+    _clear_velocity_error(candidate)
     return candidate
 
 
@@ -117,11 +119,15 @@ async def _count_exact_stars(
         if count > expected_stargazer_count:
             raise StarVelocityResponseError("GitHub star response was incomplete")
 
-        if reached_old_edge or not has_next_page:
+        if reached_old_edge:
+            return count
+        if not has_next_page:
+            if count != expected_stargazer_count:
+                raise StarVelocityResponseError("GitHub star response was incomplete")
             return count
         max_pages = max(1, (expected_stargazer_count + STARGAZERS_PAGE_SIZE - 1) // STARGAZERS_PAGE_SIZE)
         if (
-            not edges
+            len(edges) != STARGAZERS_PAGE_SIZE
             or page_count >= max_pages
             or not isinstance(end_cursor, str)
             or not end_cursor
@@ -150,6 +156,8 @@ def _page_values(payload: object) -> tuple[int, list[Any], bool, str | None]:
     edges = stargazers.get("edges")
     page_info = stargazers.get("pageInfo")
     if not isinstance(edges, list) or not isinstance(page_info, Mapping):
+        raise StarVelocityResponseError("GitHub star response was incomplete")
+    if len(edges) > STARGAZERS_PAGE_SIZE:
         raise StarVelocityResponseError("GitHub star response was incomplete")
     has_next_page = page_info.get("hasNextPage")
     end_cursor = page_info.get("endCursor")
@@ -210,6 +218,17 @@ def _clear_velocity(candidate: RepositoryCandidate) -> None:
     candidate.stars_24h_estimated = False
     candidate.growth_rate_24h = None
     candidate.velocity_hit = False
+
+
+def _record_velocity_error(candidate: RepositoryCandidate) -> None:
+    _clear_velocity_error(candidate)
+    candidate.source_errors.append(VELOCITY_ERROR)
+
+
+def _clear_velocity_error(candidate: RepositoryCandidate) -> None:
+    candidate.source_errors[:] = [
+        error for error in candidate.source_errors if error != VELOCITY_ERROR
+    ]
 
 
 def _normalize_utc(value: datetime) -> datetime:
