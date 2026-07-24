@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -96,30 +97,21 @@ class StateStore:
     ) -> None:
         seen_at = _timestamp(datetime.now(UTC))
         with self._connection() as connection:
+            self._save_collection(connection, run_id, candidates, observations, seen_at)
+
+    def save_collection_transaction(
+        self,
+        run_id: str,
+        candidates: list[RepositoryCandidate],
+        observations: list[SourceObservation],
+        observed_at: datetime,
+    ) -> None:
+        """Atomically record snapshots and all collection records for one run."""
+        timestamp = _timestamp(observed_at)
+        with self._connection() as connection:
             for candidate in candidates:
-                connection.execute(
-                    "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
-                    "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
-                    "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
-                    (candidate.canonical_name, candidate.model_dump_json(), seen_at),
-                )
-                connection.execute(
-                    "INSERT INTO run_candidates (run_id, canonical_name, candidate_json) VALUES (?, ?, ?)",
-                    (run_id, candidate.canonical_name, candidate.model_dump_json()),
-                )
-            for observation in observations:
-                validated = SourceObservation.model_validate(observation.model_dump())
-                canonical_name = f"{validated.owner}/{validated.name}".lower()
-                connection.execute(
-                    "INSERT INTO source_hits (run_id, source, canonical_name, observation_json) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        run_id,
-                        validated.source,
-                        canonical_name,
-                        validated.model_dump_json(),
-                    ),
-                )
+                self._record_snapshot(connection, candidate, timestamp)
+            self._save_collection(connection, run_id, candidates, observations, timestamp)
 
     def finish_run(
         self,
@@ -149,6 +141,16 @@ class StateStore:
             raise KeyError(run_id)
         return row[0]
 
+    def get_run_started_at(self, run_id: str) -> datetime:
+        """Return the immutable collection timestamp used for reproducible ranking."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT started_at FROM collection_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return _parse_timestamp(row[0])
+
     def get_run_candidates(self, run_id: str) -> list[RepositoryCandidate]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -161,24 +163,63 @@ class StateStore:
     def record_snapshot(self, candidate: RepositoryCandidate, observed_at: datetime) -> None:
         timestamp = _timestamp(observed_at)
         with self._connection() as connection:
+            self._record_snapshot(connection, candidate, timestamp)
+
+    @staticmethod
+    def _record_snapshot(
+        connection: sqlite3.Connection, candidate: RepositoryCandidate, timestamp: str
+    ) -> None:
+        connection.execute(
+            "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
+            "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
+            (candidate.canonical_name, candidate.model_dump_json(), timestamp),
+        )
+        connection.execute(
+            "INSERT INTO repo_snapshots "
+            "(canonical_name, observed_at, stars_total, forks_total, open_issues_count) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(canonical_name, observed_at) DO UPDATE SET "
+            "stars_total = excluded.stars_total, forks_total = excluded.forks_total, "
+            "open_issues_count = excluded.open_issues_count",
+            (
+                candidate.canonical_name,
+                timestamp,
+                candidate.stars_total,
+                candidate.forks_total,
+                candidate.open_issues_count,
+            ),
+        )
+
+    @staticmethod
+    def _save_collection(
+        connection: sqlite3.Connection,
+        run_id: str,
+        candidates: list[RepositoryCandidate],
+        observations: list[SourceObservation],
+        seen_at: str,
+    ) -> None:
+        for candidate in candidates:
             connection.execute(
                 "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
                 "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
                 "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
-                (candidate.canonical_name, candidate.model_dump_json(), timestamp),
+                (candidate.canonical_name, candidate.model_dump_json(), seen_at),
             )
             connection.execute(
-                "INSERT INTO repo_snapshots "
-                "(canonical_name, observed_at, stars_total, forks_total, open_issues_count) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(canonical_name, observed_at) DO UPDATE SET "
-                "stars_total = excluded.stars_total, forks_total = excluded.forks_total, "
-                "open_issues_count = excluded.open_issues_count",
+                "INSERT INTO run_candidates (run_id, canonical_name, candidate_json) VALUES (?, ?, ?)",
+                (run_id, candidate.canonical_name, candidate.model_dump_json()),
+            )
+        for observation in observations:
+            validated = SourceObservation.model_validate(observation.model_dump())
+            canonical_name = f"{validated.owner}/{validated.name}".lower()
+            connection.execute(
+                "INSERT INTO source_hits (run_id, source, canonical_name, observation_json) "
+                "VALUES (?, ?, ?, ?)",
                 (
-                    candidate.canonical_name,
-                    timestamp,
-                    candidate.stars_total,
-                    candidate.forks_total,
-                    candidate.open_issues_count,
+                    run_id,
+                    validated.source,
+                    canonical_name,
+                    validated.model_dump_json(),
                 ),
             )
 
@@ -219,13 +260,42 @@ class StateStore:
         run_id: str,
         ranked: list[RankedCandidate],
         reviews: list[QualityReview],
+        excluded_reasons: dict[str, str] | None = None,
+        deterministic_exclusions: dict[str, str] | None = None,
     ) -> None:
+        """Persist every rank or exclusion decision for a collection run."""
         ranked_by_name = {item.candidate.canonical_name: item for item in ranked}
         reviews_by_name = {review.canonical_name: review for review in reviews}
+        deterministic_exclusions = deterministic_exclusions or {}
+        excluded_reasons = {
+            review.canonical_name: review.exclude_reason or "llm_exclusion"
+            for review in reviews
+            if review.exclude
+        } | (excluded_reasons or {})
         with self._connection() as connection:
-            for canonical_name in sorted(ranked_by_name.keys() | reviews_by_name.keys()):
+            for canonical_name in sorted(
+                ranked_by_name.keys() | reviews_by_name.keys() | excluded_reasons.keys()
+            ):
                 item = ranked_by_name.get(canonical_name)
                 review = reviews_by_name.get(canonical_name)
+                review_json = (
+                    json.dumps(
+                        {
+                            "review": review.model_dump(mode="json"),
+                            "deterministic_exclusion": deterministic_exclusions[canonical_name],
+                        },
+                        separators=(",", ":"),
+                    )
+                    if review is not None and canonical_name in deterministic_exclusions
+                    else review.model_dump_json()
+                    if review is not None
+                    else json.dumps(
+                        {"deterministic_exclusion": excluded_reasons[canonical_name]},
+                        separators=(",", ":"),
+                    )
+                    if canonical_name in excluded_reasons
+                    else "{}"
+                )
                 connection.execute(
                     "INSERT INTO ranking_decisions "
                     "(run_id, canonical_name, review_json, score_json, excluded) VALUES (?, ?, ?, ?, ?) "
@@ -235,9 +305,9 @@ class StateStore:
                     (
                         run_id,
                         canonical_name,
-                        review.model_dump_json() if review is not None else "{}",
+                        review_json,
                         item.score.model_dump_json() if item is not None else "{}",
-                        int(review.exclude) if review is not None else 0,
+                        int(canonical_name in excluded_reasons or canonical_name in deterministic_exclusions),
                     ),
                 )
 
