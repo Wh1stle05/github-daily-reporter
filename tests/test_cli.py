@@ -245,6 +245,52 @@ def test_rank_persists_review_and_deterministic_exclusion_reason(store_with_run,
     assert excluded == 1
 
 
-def test_doctor_is_explicitly_unavailable(capsys, config_path):
+def test_doctor_reports_config_database_and_github(monkeypatch, capsys, config_path):
+    monkeypatch.setattr(
+        "github_daily_reporter.cli.probe_github", lambda config: {"ok": True, "remaining": 4999}
+    )
+    monkeypatch.setattr(
+        "github_daily_reporter.cli.probe_hermes",
+        lambda: {"ok": True, "timezone": "Asia/Shanghai"},
+    )
+
+    assert main(["doctor", "--config", str(config_path)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["checks"]["timezone_match"] is True
+    assert result["checks"]["database_writable"] is True
+
+
+def test_doctor_fails_on_timezone_mismatch(monkeypatch, capsys, config_path):
+    monkeypatch.setattr("github_daily_reporter.cli.probe_github", lambda config: {"ok": True})
+    monkeypatch.setattr("github_daily_reporter.cli.probe_hermes", lambda: {"ok": True, "timezone": "UTC"})
+
     assert main(["doctor", "--config", str(config_path)]) == 2
-    assert "doctor checks not implemented" in capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["checks"]["timezone_match"] is False
+
+
+def test_doctor_prints_json_for_malformed_yaml(capsys, config_path):
+    config_path.write_text("timezone: [not valid yaml", encoding="utf-8")
+
+    assert main(["doctor", "--config", str(config_path)]) == 2
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["checks"]["config_valid"] is False
+    assert captured.err == ""
+
+
+def test_doctor_prints_json_when_database_initialization_fails(monkeypatch, capsys, config_path):
+    def fail_database(_path):
+        raise PermissionError("database unavailable")
+
+    monkeypatch.setattr("github_daily_reporter.cli.StateStore", fail_database)
+    monkeypatch.setattr("github_daily_reporter.cli.probe_github", lambda config: {"ok": True})
+    monkeypatch.setattr(
+        "github_daily_reporter.cli.probe_hermes",
+        lambda: {"ok": True, "timezone": "Asia/Shanghai"},
+    )
+
+    assert main(["doctor", "--config", str(config_path)]) == 2
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["checks"]["database_writable"] is False
+    assert captured.err == ""
