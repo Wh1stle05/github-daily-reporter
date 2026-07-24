@@ -21,6 +21,7 @@ REPO_STARS_QUERY = """query RepoStars($owner: String!, $name: String!, $cursor: 
 }"""
 
 VELOCITY_ERROR = "GitHub star velocity unavailable"
+STARGAZERS_PAGE_SIZE = 100
 SnapshotEstimator = Callable[[str, int, datetime, datetime], tuple[int, datetime] | None]
 
 
@@ -30,17 +31,30 @@ class StarVelocityResponseError(ValueError):
 
 def count_recent_stars(edges: list[Any], cutoff: datetime) -> tuple[int, bool]:
     """Count descending stargazer edges through the first edge before ``cutoff``."""
+    count, reached_old_edge, _ = _count_page_stars(edges, cutoff, None)
+    return count, reached_old_edge
+
+
+def _count_page_stars(
+    edges: list[Any], cutoff: datetime, previous_starred_at: datetime | None
+) -> tuple[int, bool, datetime | None]:
+    """Count a page while validating its order against prior pages."""
     cutoff_utc = _normalize_utc(cutoff)
     if not isinstance(edges, list):
         raise StarVelocityResponseError("GitHub star response was incomplete")
 
     count = 0
+    reached_old_edge = False
     for edge in edges:
         starred_at = _starred_at(edge)
+        if previous_starred_at is not None and starred_at > previous_starred_at:
+            raise StarVelocityResponseError("GitHub star response was incomplete")
+        previous_starred_at = starred_at
         if starred_at < cutoff_utc:
-            return count, True
-        count += 1
-    return count, False
+            reached_old_edge = True
+        elif not reached_old_edge:
+            count += 1
+    return count, reached_old_edge, previous_starred_at
 
 
 async def enrich_velocity(
@@ -81,24 +95,44 @@ async def _count_exact_stars(
     cursor: str | None = None
     seen_cursors: set[str] = set()
     count = 0
+    expected_stargazer_count: int | None = None
+    previous_starred_at: datetime | None = None
+    page_count = 0
     while True:
         payload = await client.graphql(
             REPO_STARS_QUERY,
             {"owner": owner, "name": name, "cursor": cursor},
         )
-        edges, has_next_page, end_cursor = _page_values(payload)
-        page_count, reached_old_edge = count_recent_stars(edges, cutoff)
-        count += page_count
+        stargazer_count, edges, has_next_page, end_cursor = _page_values(payload)
+        if expected_stargazer_count is None:
+            expected_stargazer_count = stargazer_count
+        elif stargazer_count != expected_stargazer_count:
+            raise StarVelocityResponseError("GitHub star response was incomplete")
+
+        page_count += 1
+        recent_count, reached_old_edge, previous_starred_at = _count_page_stars(
+            edges, cutoff, previous_starred_at
+        )
+        count += recent_count
+        if count > expected_stargazer_count:
+            raise StarVelocityResponseError("GitHub star response was incomplete")
 
         if reached_old_edge or not has_next_page:
             return count
-        if not isinstance(end_cursor, str) or not end_cursor or end_cursor in seen_cursors:
+        max_pages = max(1, (expected_stargazer_count + STARGAZERS_PAGE_SIZE - 1) // STARGAZERS_PAGE_SIZE)
+        if (
+            not edges
+            or page_count >= max_pages
+            or not isinstance(end_cursor, str)
+            or not end_cursor
+            or end_cursor in seen_cursors
+        ):
             raise StarVelocityResponseError("GitHub star response was incomplete")
         seen_cursors.add(end_cursor)
         cursor = end_cursor
 
 
-def _page_values(payload: object) -> tuple[list[Any], bool, str | None]:
+def _page_values(payload: object) -> tuple[int, list[Any], bool, str | None]:
     if not isinstance(payload, Mapping):
         raise StarVelocityResponseError("GitHub star response was incomplete")
     repository = payload.get("repository")
@@ -123,7 +157,7 @@ def _page_values(payload: object) -> tuple[list[Any], bool, str | None]:
         end_cursor is not None and not isinstance(end_cursor, str)
     ):
         raise StarVelocityResponseError("GitHub star response was incomplete")
-    return edges, has_next_page, end_cursor
+    return stargazer_count, edges, has_next_page, end_cursor
 
 
 def _starred_at(edge: object) -> datetime:

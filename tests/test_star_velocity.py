@@ -14,11 +14,15 @@ def _edge(starred_at: datetime) -> dict[str, str]:
 
 
 def _page(
-    edges: list[dict[str, str]], *, has_next_page: bool = False, end_cursor: str | None = None
+    edges: list[dict[str, str]],
+    *,
+    stargazer_count: int = 100,
+    has_next_page: bool = False,
+    end_cursor: str | None = None,
 ) -> dict[str, Any]:
     return {
         "repository": {
-            "stargazerCount": 100,
+            "stargazerCount": stargazer_count,
             "stargazers": {
                 "edges": edges,
                 "pageInfo": {
@@ -101,6 +105,19 @@ def test_count_recent_stars_rejects_malformed_timestamp():
         count_recent_stars([{"starredAt": "not-a-timestamp"}], NOW - timedelta(hours=24))
 
 
+def test_count_recent_stars_rejects_edges_out_of_descending_order():
+    from github_daily_reporter.collectors.star_velocity import (
+        StarVelocityResponseError,
+        count_recent_stars,
+    )
+
+    with pytest.raises(StarVelocityResponseError, match="incomplete"):
+        count_recent_stars(
+            [_edge(NOW - timedelta(hours=25)), _edge(NOW - timedelta(hours=1))],
+            NOW - timedelta(hours=24),
+        )
+
+
 @pytest.mark.asyncio
 async def test_velocity_hit_is_strictly_greater_than_threshold(
     candidate: RepositoryCandidate, fake_graphql: FakeGraphQL
@@ -125,8 +142,16 @@ async def test_enrich_velocity_continues_pages_until_an_old_edge(
     from github_daily_reporter.collectors.star_velocity import enrich_velocity
 
     graphql = FakeGraphQL(
-        _page([_edge(NOW - timedelta(hours=1))], has_next_page=True, end_cursor="page-1"),
-        _page([_edge(NOW - timedelta(hours=2)), _edge(NOW - timedelta(hours=25))]),
+        _page(
+            [_edge(NOW - timedelta(hours=1))],
+            stargazer_count=200,
+            has_next_page=True,
+            end_cursor="page-1",
+        ),
+        _page(
+            [_edge(NOW - timedelta(hours=2)), _edge(NOW - timedelta(hours=25))],
+            stargazer_count=200,
+        ),
     )
 
     enriched = await enrich_velocity(candidate, graphql, NOW, 24, 50, None)
@@ -156,6 +181,66 @@ async def test_enrich_velocity_stops_without_fetching_after_old_edge(
     enriched = await enrich_velocity(candidate, graphql, NOW, 24, 50, None)
 
     assert enriched.stars_24h == 1
+    assert len(graphql.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_enrich_velocity_falls_back_when_star_order_decreases_across_pages(
+    candidate: RepositoryCandidate, snapshot_estimator: Any
+):
+    from github_daily_reporter.collectors.star_velocity import enrich_velocity
+
+    graphql = FakeGraphQL(
+        _page([_edge(NOW - timedelta(hours=2))], has_next_page=True, end_cursor="page-1"),
+        _page([_edge(NOW - timedelta(hours=1))]),
+    )
+    snapshot_estimator.return_value = (4, NOW - timedelta(hours=24))
+
+    enriched = await enrich_velocity(candidate, graphql, NOW, 24, 50, snapshot_estimator)
+
+    assert enriched.stars_24h == 4
+    assert enriched.stars_24h_estimated is True
+
+
+@pytest.mark.asyncio
+async def test_enrich_velocity_rejects_an_empty_page_with_a_next_cursor(
+    candidate: RepositoryCandidate, snapshot_estimator: Any
+):
+    from github_daily_reporter.collectors.star_velocity import enrich_velocity
+
+    graphql = FakeGraphQL(
+        _page([], has_next_page=True, end_cursor="page-1"),
+        _page([_edge(NOW - timedelta(hours=1))]),
+    )
+    snapshot_estimator.return_value = (5, NOW - timedelta(hours=24))
+
+    enriched = await enrich_velocity(candidate, graphql, NOW, 24, 50, snapshot_estimator)
+
+    assert enriched.stars_24h == 5
+    assert enriched.stars_24h_estimated is True
+    assert len(graphql.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_enrich_velocity_rejects_more_pages_than_stargazer_count_allows(
+    candidate: RepositoryCandidate, snapshot_estimator: Any
+):
+    from github_daily_reporter.collectors.star_velocity import enrich_velocity
+
+    graphql = FakeGraphQL(
+        _page(
+            [_edge(NOW - timedelta(minutes=offset)) for offset in range(100)],
+            has_next_page=True,
+            end_cursor="page-1",
+        ),
+        _page([_edge(NOW - timedelta(hours=2))]),
+    )
+    snapshot_estimator.return_value = (6, NOW - timedelta(hours=24))
+
+    enriched = await enrich_velocity(candidate, graphql, NOW, 24, 50, snapshot_estimator)
+
+    assert enriched.stars_24h == 6
+    assert enriched.stars_24h_estimated is True
     assert len(graphql.calls) == 1
 
 
@@ -237,8 +322,18 @@ async def test_enrich_velocity_falls_back_when_pagination_cursor_repeats(
     from github_daily_reporter.collectors.star_velocity import enrich_velocity
 
     graphql = FakeGraphQL(
-        _page([_edge(NOW - timedelta(hours=1))], has_next_page=True, end_cursor="repeat"),
-        _page([_edge(NOW - timedelta(hours=2))], has_next_page=True, end_cursor="repeat"),
+        _page(
+            [_edge(NOW - timedelta(hours=1))],
+            stargazer_count=200,
+            has_next_page=True,
+            end_cursor="repeat",
+        ),
+        _page(
+            [_edge(NOW - timedelta(hours=2))],
+            stargazer_count=200,
+            has_next_page=True,
+            end_cursor="repeat",
+        ),
     )
     snapshot_estimator.return_value = (7, NOW - timedelta(hours=24))
 
