@@ -1,0 +1,45 @@
+{
+  "trending_html": "<article class=\"Box-row\"><h2><a href=\"/Acme/Tool\">Acme / Tool</a></h2><p>A useful tool</p><span itemprop=\"programmingLanguage\">Python</span><a class=\"Link--muted\">150</a><a class=\"Link--muted\">5</a><span>12 stars today</span></article>",
+  "search": {
+    "total_count": 1,
+    "incomplete_results": false,
+    "items": [{"full_name": "Acme/Tool", "html_url": "https://github.com/Acme/Tool"}]
+  },
+  "algolia": {
+    "hits": [{"objectID": "123", "url": "https://github.com/Acme/Tool", "story_text": ""}],
+    "nbPages": 1
+  },
+  "hn_item": {"id": 123, "type": "story", "url": "https://github.com/Acme/Tool", "score": 10, "descendants": 3},
+  "repository": {
+    "full_name": "Acme/Tool",
+    "html_url": "https://github.com/Acme/Tool",
+    "description": "A useful tool",
+    "created_at": "2026-07-20T00:00:00Z",
+    "pushed_at": "2026-07-24T10:00:00Z",
+    "archived": false,
+    "disabled": false,
+    "fork": false,
+    "size": 100,
+    "license": {"spdx_id": "MIT"},
+    "language": "Python",
+    "stargazers_count": 150,
+    "forks_count": 5,
+    "open_issues_count": 1
+  },
+  "readme": "IyBUb29sCgpVc2VmdWwgcmVwb3NpdG9yeS4=",
+  "graphql": {
+    "data": {
+      "repository": {
+        "stargazerCount": 3,
+        "stargazers": {
+          "edges": [
+            {"starredAt": "2026-07-24T11:00:00Z"},
+            {"starredAt": "2026-07-24T10:00:00Z"},
+            {"starredAt": "2026-07-24T09:00:00Z"}
+          ],
+          "pageInfo": {"hasNextPage": false, "endCursor": null}
+        }
+      }
+    }
+  }
+}

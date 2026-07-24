@@ -74,3 +74,13 @@ To rotate the GitHub token, replace only `GITHUB_TOKEN` in `.env`, run
 `doctor`, then run one manual collection before resuming a paused job. Use a
 read-only token suitable for public repository metadata. Do not print, paste,
 or include the token in logs, reports, cron prompts, or commits.
+
+### Deployment verification (2026-07-24)
+
+Credentialed VPS verification has not been performed from this checkout. It is
+an operator prerequisite before enabling delivery: with a read-only GitHub
+token and real `TELEGRAM_DELIVER_TARGET`, run `doctor`, one `collect`, and the
+Hermes manual cron commands shown above. Record the actual Hermes job ID,
+execution status, source-health summary, Telegram message ID (when available),
+and next-run timestamp only after that live check succeeds. Do not substitute
+fixture or local-test results for deployment evidence.
