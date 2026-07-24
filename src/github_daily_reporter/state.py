@@ -96,6 +96,17 @@ class StateStore:
     ) -> None:
         seen_at = _timestamp(datetime.now(UTC))
         with self._connection() as connection:
+            for candidate in candidates:
+                connection.execute(
+                    "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
+                    "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
+                    (candidate.canonical_name, candidate.model_dump_json(), seen_at),
+                )
+                connection.execute(
+                    "INSERT INTO run_candidates (run_id, canonical_name, candidate_json) VALUES (?, ?, ?)",
+                    (run_id, candidate.canonical_name, candidate.model_dump_json()),
+                )
             for observation in observations:
                 validated = SourceObservation.model_validate(observation.model_dump())
                 canonical_name = f"{validated.owner}/{validated.name}".lower()
@@ -108,17 +119,6 @@ class StateStore:
                         canonical_name,
                         validated.model_dump_json(),
                     ),
-                )
-            for candidate in candidates:
-                connection.execute(
-                    "INSERT INTO repositories (canonical_name, candidate_json, last_seen_at) "
-                    "VALUES (?, ?, ?) ON CONFLICT(canonical_name) DO UPDATE SET "
-                    "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
-                    (candidate.canonical_name, candidate.model_dump_json(), seen_at),
-                )
-                connection.execute(
-                    "INSERT INTO run_candidates (run_id, canonical_name, candidate_json) VALUES (?, ?, ?)",
-                    (run_id, candidate.canonical_name, candidate.model_dump_json()),
                 )
 
     def finish_run(
@@ -198,7 +198,7 @@ class StateStore:
         cutoff: datetime,
         now: datetime,
     ) -> tuple[int, datetime] | None:
-        earliest = max(cutoff, now - timedelta(hours=28))
+        earliest = now - timedelta(hours=28)
         latest = now - timedelta(hours=20)
         with self._connection() as connection:
             rows = connection.execute(
@@ -210,7 +210,7 @@ class StateStore:
             return None
         stars_total, observed_at = min(
             rows,
-            key=lambda row: abs((_parse_timestamp(row[1]) - (now - timedelta(hours=24))).total_seconds()),
+            key=lambda row: abs((_parse_timestamp(row[1]) - cutoff).total_seconds()),
         )
         return max(current_stars - stars_total, 0), _parse_timestamp(observed_at)
 
@@ -220,10 +220,12 @@ class StateStore:
         ranked: list[RankedCandidate],
         reviews: list[QualityReview],
     ) -> None:
+        ranked_by_name = {item.candidate.canonical_name: item for item in ranked}
         reviews_by_name = {review.canonical_name: review for review in reviews}
         with self._connection() as connection:
-            for item in ranked:
-                review = reviews_by_name[item.candidate.canonical_name]
+            for canonical_name in sorted(ranked_by_name.keys() | reviews_by_name.keys()):
+                item = ranked_by_name.get(canonical_name)
+                review = reviews_by_name.get(canonical_name)
                 connection.execute(
                     "INSERT INTO ranking_decisions "
                     "(run_id, canonical_name, review_json, score_json, excluded) VALUES (?, ?, ?, ?, ?) "
@@ -232,10 +234,10 @@ class StateStore:
                     "excluded = excluded.excluded",
                     (
                         run_id,
-                        item.candidate.canonical_name,
-                        review.model_dump_json(),
-                        item.score.model_dump_json(),
-                        int(review.exclude),
+                        canonical_name,
+                        review.model_dump_json() if review is not None else "{}",
+                        item.score.model_dump_json() if item is not None else "{}",
+                        int(review.exclude) if review is not None else 0,
                     ),
                 )
 

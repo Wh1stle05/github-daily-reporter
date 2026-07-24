@@ -3,7 +3,12 @@ import sqlite3
 
 import pytest
 
-from github_daily_reporter.models import SourceObservation
+from github_daily_reporter.models import (
+    QualityReview,
+    RankedCandidate,
+    ScoreBreakdown,
+    SourceObservation,
+)
 from github_daily_reporter.state import StateStore
 
 
@@ -20,6 +25,21 @@ def candidate(name: str = "owner/repo", stars_total: int = 100):
     )
 
 
+def ranked_candidate(name: str = "owner/repo", score: float = 42.0):
+    return RankedCandidate(
+        candidate=candidate(name),
+        score=ScoreBreakdown(
+            momentum=1.0,
+            evidence=2.0,
+            freshness=3.0,
+            hacker_news=4.0,
+            quality=5.0,
+            popularity=6.0,
+            final=score,
+        ),
+    )
+
+
 def test_run_transitions_and_candidates_round_trip(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     run_id = store.start_run(datetime.now(UTC))
@@ -30,15 +50,27 @@ def test_run_transitions_and_candidates_round_trip(tmp_path):
     assert store.get_run_candidates(run_id)[0].canonical_name == "owner/repo"
 
 
-def test_save_collection_rolls_back_on_invalid_observation(tmp_path):
+def test_save_collection_rolls_back_candidate_writes_on_invalid_observation(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "state.sqlite3")
     run_id = store.start_run(datetime.now(UTC))
     bad = SourceObservation.model_construct(source="unknown")
+    statements = []
+    original_connection = store._connection
+
+    def traced_connection():
+        connection = original_connection()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store, "_connection", traced_connection)
 
     with pytest.raises(Exception):
         store.save_collection(run_id, [candidate()], [bad])
 
+    assert any("INSERT INTO repositories" in statement for statement in statements)
+    assert any("INSERT INTO run_candidates" in statement for statement in statements)
     assert store.get_run_candidates(run_id) == []
+    assert "owner/repo" not in store.recent_repository_names(datetime.now(UTC) - timedelta(days=1))
 
 
 def test_recent_repositories_respects_cutoff(tmp_path):
@@ -61,6 +93,100 @@ def test_estimate_stars_24h_uses_closest_snapshot_in_window(tmp_path):
     assert store.estimate_stars_24h(
         "owner/repo", 100, now - timedelta(days=2), now
     ) == (30, expected_at)
+
+
+def test_estimate_stars_24h_keeps_24h_snapshot_when_cutoff_is_22h(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    now = datetime(2026, 7, 23, 12, tzinfo=UTC)
+    expected_at = now - timedelta(hours=24)
+    store.record_snapshot(candidate(stars_total=70), expected_at)
+
+    assert store.estimate_stars_24h(
+        "owner/repo", 100, now - timedelta(hours=22), now
+    ) == (30, expected_at)
+
+
+def test_estimate_stars_24h_uses_inclusive_window_boundaries_and_cutoff_target(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    now = datetime(2026, 7, 23, 12, tzinfo=UTC)
+    earliest = now - timedelta(hours=28)
+    latest = now - timedelta(hours=20)
+    store.record_snapshot(candidate(stars_total=20), earliest)
+    store.record_snapshot(candidate(stars_total=40), now - timedelta(hours=24))
+    store.record_snapshot(candidate(stars_total=80), latest)
+
+    assert store.estimate_stars_24h(
+        "owner/repo", 100, now - timedelta(hours=21), now
+    ) == (20, latest)
+    assert store.estimate_stars_24h(
+        "owner/repo", 100, now - timedelta(hours=27), now
+    ) == (80, earliest)
+
+
+def test_save_ranking_persists_excluded_review_without_ranked_candidate(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = store.start_run(datetime.now(UTC))
+    review = QualityReview(
+        canonical_name="review-only/repo",
+        usefulness=1,
+        completeness=2,
+        novelty=3,
+        maintenance=4,
+        exclude=True,
+        exclude_reason="duplicate",
+    )
+
+    store.save_ranking(run_id, [], [review])
+
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT review_json, score_json, excluded FROM ranking_decisions "
+            "WHERE run_id = ? AND canonical_name = ?",
+            (run_id, review.canonical_name),
+        ).fetchone()
+
+    assert row == (review.model_dump_json(), "{}", 1)
+
+
+def test_save_ranking_persists_ranked_candidate_without_review(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = store.start_run(datetime.now(UTC))
+    ranked = ranked_candidate("ranked-only/repo")
+
+    store.save_ranking(run_id, [ranked], [])
+
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT review_json, score_json, excluded FROM ranking_decisions "
+            "WHERE run_id = ? AND canonical_name = ?",
+            (run_id, ranked.candidate.canonical_name),
+        ).fetchone()
+
+    assert row == ("{}", ranked.score.model_dump_json(), 0)
+
+
+def test_save_ranking_persists_actual_review_and_score_for_ranked_review(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    run_id = store.start_run(datetime.now(UTC))
+    ranked = ranked_candidate("ranked-and-reviewed/repo")
+    review = QualityReview(
+        canonical_name=ranked.candidate.canonical_name,
+        usefulness=1,
+        completeness=2,
+        novelty=3,
+        maintenance=4,
+    )
+
+    store.save_ranking(run_id, [ranked], [review])
+
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT review_json, score_json, excluded FROM ranking_decisions "
+            "WHERE run_id = ? AND canonical_name = ?",
+            (run_id, ranked.candidate.canonical_name),
+        ).fetchone()
+
+    assert row == (review.model_dump_json(), ranked.score.model_dump_json(), 0)
 
 
 def test_initialization_creates_required_tables(tmp_path):
