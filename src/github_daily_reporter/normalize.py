@@ -28,6 +28,25 @@ NON_REPOSITORY_PATHS = {
     "site",
     "organizations",
     "users",
+    "account",
+    "blog",
+    "businesses",
+    "codespaces",
+    "contact",
+    "customer-stories",
+    "discussions",
+    "gist",
+    "integrations",
+    "issues",
+    "pricing",
+    "pulls",
+    "readme",
+    "security",
+    "signup",
+    "stars",
+    "teams",
+    "trending",
+    "watch",
 }
 
 OWNER_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
@@ -97,7 +116,7 @@ def merge_observations(observations: Iterable[SourceObservation]) -> dict[str, d
             result["hn_comments"] = max(
                 result["hn_comments"], _nonnegative_int(observation.source_metadata.get("comments"))
             )
-            item_id = observation.source_metadata.get("item_id")
+            item_id = _positive_int(observation.source_metadata.get("item_id"))
             if item_id is not None and item_id not in result["hn_item_ids"]:
                 result["hn_item_ids"].append(item_id)
 
@@ -141,6 +160,25 @@ def _nonnegative_int(value: object) -> int:
         return 0
     if isinstance(value, int):
         return max(value, 0)
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
+    parsed = _ascii_integer(value)
+    if parsed is not None:
+        return parsed
     return 0
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    parsed = _ascii_integer(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _ascii_integer(value: object) -> int | None:
+    if not isinstance(value, str) or not value or any(char < "0" or char > "9" for char in value):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None

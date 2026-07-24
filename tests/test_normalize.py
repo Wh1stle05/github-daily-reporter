@@ -115,10 +115,37 @@ def test_extract_repo_ref_decodes_once_and_normalizes_encoded_git_suffix() -> No
         "site",
         "organizations",
         "users",
+        "account",
+        "blog",
+        "businesses",
+        "codespaces",
+        "contact",
+        "customer-stories",
+        "discussions",
+        "gist",
+        "integrations",
+        "issues",
+        "pricing",
+        "pulls",
+        "readme",
+        "security",
+        "signup",
+        "stars",
+        "teams",
+        "trending",
+        "watch",
     ],
 )
 def test_extract_repo_ref_rejects_reserved_github_routes(route: str) -> None:
     assert extract_repo_ref(f"https://github.com/{route}/project") is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["issues/assigned", "codespaces/new", "signup/plan", "readme/features", "teams/security"],
+)
+def test_extract_repo_ref_rejects_reviewer_application_route_examples(path: str) -> None:
+    assert extract_repo_ref(f"https://github.com/{path}") is None
 
 
 def test_merge_observations_combines_trending_and_hn_signals_by_identity() -> None:
@@ -181,3 +208,33 @@ def test_merge_observations_is_order_independent_for_duplicate_signals() -> None
 
     for ordered_observations in permutations(observations):
         assert merge_observations(ordered_observations)["owner/repo"] == expected
+
+
+def test_merge_observations_normalizes_only_positive_ascii_hn_item_ids() -> None:
+    merged = merge_observations(
+        [
+            observation("hacker_news", item_id=3),
+            observation("hacker_news", item_id="007"),
+            observation("hacker_news", item_id=7),
+            observation("hacker_news", item_id=True),
+            observation("hacker_news", item_id=None),
+            observation("hacker_news", item_id=0),
+            observation("hacker_news", item_id=-1),
+            observation("hacker_news", item_id="²"),
+            observation("hacker_news", item_id="7x"),
+        ]
+    )
+
+    assert merged["owner/repo"]["hn_item_ids"] == [3, 7]
+
+
+def test_merge_observations_rejects_unicode_and_malformed_hn_metrics() -> None:
+    merged = merge_observations(
+        [
+            observation("hacker_news", points="²", comments="not-a-number"),
+            observation("hacker_news", points="12", comments="8"),
+        ]
+    )
+
+    assert merged["owner/repo"]["hn_points"] == 12
+    assert merged["owner/repo"]["hn_comments"] == 8
