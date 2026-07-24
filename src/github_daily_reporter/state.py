@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -140,6 +141,16 @@ class StateStore:
             raise KeyError(run_id)
         return row[0]
 
+    def get_run_started_at(self, run_id: str) -> datetime:
+        """Return the immutable collection timestamp used for reproducible ranking."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT started_at FROM collection_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return _parse_timestamp(row[0])
+
     def get_run_candidates(self, run_id: str) -> list[RepositoryCandidate]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -249,13 +260,42 @@ class StateStore:
         run_id: str,
         ranked: list[RankedCandidate],
         reviews: list[QualityReview],
+        excluded_reasons: dict[str, str] | None = None,
+        deterministic_exclusions: dict[str, str] | None = None,
     ) -> None:
+        """Persist every rank or exclusion decision for a collection run."""
         ranked_by_name = {item.candidate.canonical_name: item for item in ranked}
         reviews_by_name = {review.canonical_name: review for review in reviews}
+        deterministic_exclusions = deterministic_exclusions or {}
+        excluded_reasons = {
+            review.canonical_name: review.exclude_reason or "llm_exclusion"
+            for review in reviews
+            if review.exclude
+        } | (excluded_reasons or {})
         with self._connection() as connection:
-            for canonical_name in sorted(ranked_by_name.keys() | reviews_by_name.keys()):
+            for canonical_name in sorted(
+                ranked_by_name.keys() | reviews_by_name.keys() | excluded_reasons.keys()
+            ):
                 item = ranked_by_name.get(canonical_name)
                 review = reviews_by_name.get(canonical_name)
+                review_json = (
+                    json.dumps(
+                        {
+                            "review": review.model_dump(mode="json"),
+                            "deterministic_exclusion": deterministic_exclusions[canonical_name],
+                        },
+                        separators=(",", ":"),
+                    )
+                    if review is not None and canonical_name in deterministic_exclusions
+                    else review.model_dump_json()
+                    if review is not None
+                    else json.dumps(
+                        {"deterministic_exclusion": excluded_reasons[canonical_name]},
+                        separators=(",", ":"),
+                    )
+                    if canonical_name in excluded_reasons
+                    else "{}"
+                )
                 connection.execute(
                     "INSERT INTO ranking_decisions "
                     "(run_id, canonical_name, review_json, score_json, excluded) VALUES (?, ?, ?, ?, ?) "
@@ -265,9 +305,9 @@ class StateStore:
                     (
                         run_id,
                         canonical_name,
-                        review.model_dump_json() if review is not None else "{}",
+                        review_json,
                         item.score.model_dump_json() if item is not None else "{}",
-                        int(review.exclude) if review is not None else 0,
+                        int(canonical_name in excluded_reasons or canonical_name in deterministic_exclusions),
                     ),
                 )
 
