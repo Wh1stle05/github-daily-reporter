@@ -7,4 +7,8 @@ __pycache__/
 *.egg-info/
 *.sqlite3
 data/runs/
+data/reports/
+data/state.db
+*.lock
+bootstrap_db.py
 var/
