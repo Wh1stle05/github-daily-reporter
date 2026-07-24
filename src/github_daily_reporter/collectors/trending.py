@@ -1,6 +1,10 @@
 """GitHub Trending discovery collector."""
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime
+import math
+import random
 import re
 from urllib.parse import urljoin
 
@@ -12,7 +16,11 @@ from github_daily_reporter.normalize import extract_repo_ref
 
 
 TRENDING_URL = "https://github.com/trending"
-_COUNT_PATTERN = re.compile(r"\d[\d,]*")
+DEFAULT_MAX_RESPONSE_BYTES = 2_000_000
+DEFAULT_MAX_ATTEMPTS = 3
+RETRYABLE_STATUS = {429, 502, 503, 504}
+USER_AGENT = "github-daily-reporter/0.1"
+_COUNT_PATTERN = re.compile(r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?[kKmM]?")
 _STARS_TODAY_PATTERN = re.compile(r"stars\s+today", re.IGNORECASE)
 
 
@@ -20,12 +28,25 @@ class TrendingParseError(ValueError):
     """GitHub Trending HTML did not contain recognizable repository rows."""
 
 
+class TrendingFetchError(RuntimeError):
+    """GitHub Trending could not be fetched safely."""
+
+
 def parse_count(text: str) -> int:
-    """Extract the first comma-separated integer from GitHub's counter text."""
+    """Extract one well-formed ASCII GitHub counter from surrounding label text."""
     match = _COUNT_PATTERN.search(text)
-    if match is None:
+    if match is None or any(character.isnumeric() for character in text[: match.start()] + text[match.end() :]):
         raise ValueError("count text did not contain an integer")
-    return int(match.group().replace(",", ""))
+    count = match.group()
+    suffix = count[-1].lower() if count[-1].lower() in {"k", "m"} else ""
+    number = count[:-1] if suffix else count
+    if "." in number and not suffix:
+        raise ValueError("decimal count must use a suffix")
+    value = float(number.replace(",", ""))
+    if not math.isfinite(value):
+        raise ValueError("count was not finite")
+    multiplier = {"": 1, "k": 1_000, "m": 1_000_000}[suffix]
+    return int(value * multiplier)
 
 
 def _optional_count(node_text: str | None) -> int | None:
@@ -37,12 +58,16 @@ def _optional_count(node_text: str | None) -> int | None:
         return None
 
 
-def parse_trending(html: str, observed_at: datetime) -> list[SourceObservation]:
+def parse_trending(
+    html: str, observed_at: datetime, *, limit: int = 100
+) -> list[SourceObservation]:
     """Parse repository observations from a GitHub Trending document."""
     soup = BeautifulSoup(html, "html.parser")
     observations: list[SourceObservation] = []
 
     for rank, row in enumerate(soup.select("article.Box-row"), start=1):
+        if len(observations) >= limit:
+            break
         link = row.select_one("h2 a")
         if link is None:
             continue
@@ -85,14 +110,70 @@ def parse_trending(html: str, observed_at: datetime) -> list[SourceObservation]:
 
 
 async def collect_trending(
-    client: httpx.AsyncClient, observed_at: datetime
+    client: httpx.AsyncClient,
+    observed_at: datetime,
+    *,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> CollectorResult:
     """Fetch GitHub's daily Trending page and return its repository observations."""
-    response = await client.get(TRENDING_URL, params={"since": "daily"})
-    response.raise_for_status()
-    observations = parse_trending(response.text, observed_at)
+    if max_response_bytes < 0:
+        raise ValueError("max_response_bytes must not be negative")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least one")
+
+    html = await _fetch_trending_html(client, max_response_bytes, max_attempts, sleep)
+    observations = parse_trending(html, observed_at)
     return CollectorResult(
         source="trending",
         observations=observations,
         health=SourceHealth(source="trending", status="success", item_count=len(observations)),
     )
+
+
+async def _fetch_trending_html(
+    client: httpx.AsyncClient,
+    max_response_bytes: int,
+    max_attempts: int,
+    sleep: Callable[[float], Awaitable[object]],
+) -> str:
+    for attempt in range(1, max_attempts + 1):
+        async with client.stream(
+            "GET",
+            TRENDING_URL,
+            params={"since": "daily"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=20,
+        ) as response:
+            if response.status_code not in RETRYABLE_STATUS:
+                response.raise_for_status()
+                return await _read_response_text(response, max_response_bytes)
+            if attempt == max_attempts:
+                response.raise_for_status()
+            delay = _retry_delay(response, attempt)
+        await sleep(delay)
+    raise RuntimeError("unreachable")
+
+
+async def _read_response_text(response: httpx.Response, max_response_bytes: int) -> str:
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > max_response_bytes:
+            raise TrendingFetchError("GitHub Trending response exceeded maximum size")
+        chunks.append(chunk)
+    return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            delay = -1
+        if math.isfinite(delay) and delay >= 0:
+            return min(delay, 60.0)
+    return min(2 ** (attempt - 1) + random.uniform(0, 0.25), 10.0)
