@@ -41,6 +41,9 @@ _ALERT_CATEGORIES = frozenset(
 )
 _ALERT_SOURCE_STATES = frozenset({"success", "degraded", "failed"})
 _MARKDOWN_ESCAPES = str.maketrans({char: f"\\{char}" for char in r"\\_*[]()~`>#+-=|{}.!"})
+_GITHUB_REPOSITORY_URL = re.compile(
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z"
+)
 
 
 def render_report(
@@ -99,12 +102,13 @@ def _render_entries(items: list[Any]) -> list[str]:
         candidate = _field(ranked, "candidate", ranked)
         name = _safe_text(_field(candidate, "canonical_name", _field(candidate, "full_name", "unknown/repository")), 200)
         url = _safe_url(_field(candidate, "html_url", ""))
+        title = f"[{_escape_markdown(name)}]({_escape_link_url(url)})" if url else _escape_markdown(name)
         review = _field(ranked, "review", _field(ranked, "llm_review", None))
         summary = _copy(review, "summary_zh", "暂无简介")
         highlight = _copy(review, "highlight_zh", "暂无特别看点")
         lines.extend(
             [
-                f"\\#\\#\\# {index}\\. [{_escape_markdown(name)}]({_escape_link_url(url)})",
+                f"\\#\\#\\# {index}\\. {title}",
                 _escape_markdown(summary),
                 _escape_markdown(f"- 信号：{_signal(candidate, ranked)}"),
                 _escape_markdown(f"- 看点：{highlight}"),
@@ -190,9 +194,9 @@ def _safe_text(value: Any, limit: int) -> str:
     return text[:limit]
 
 
-def _safe_url(value: Any) -> str:
+def _safe_url(value: Any) -> str | None:
     url = str(value or "")
-    return url if url.startswith(("https://", "http://")) else "https://github.com/"
+    return url if _GITHUB_REPOSITORY_URL.fullmatch(url) else None
 
 
 def _escape_link_url(url: str) -> str:

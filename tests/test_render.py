@@ -108,6 +108,7 @@ def test_failure_alert_allowlists_caller_controlled_identifiers():
 
 def test_report_escapes_markdown_v2_text_but_preserves_repository_link():
     ranked = _ranked("owner_repo", momentum_source="snapshot_estimate")
+    ranked.candidate.html_url = "https://github.com/owner_repo/repository"
     ranked.candidate.primary_language = "C++"
     ranked.candidate.license_spdx = "Apache-2.0"
 
@@ -118,7 +119,7 @@ def test_report_escapes_markdown_v2_text_but_preserves_repository_link():
         source_health=[SimpleNamespace(source="trending", status="degraded", item_count=1)],
     )
 
-    link = "[owner\\_repo](https://github.com/owner_repo)"
+    link = "[owner\\_repo](https://github.com/owner_repo/repository)"
     assert link in text
     assert "\\# GitHub 每日趋势 · 2026\\-07\\-27" in text
     assert "\\#\\#\\# 1\\. " + link in text
@@ -142,13 +143,26 @@ def test_failure_alert_escapes_markdown_v2_literals_and_allowlisted_values():
     assert _first_unescaped_markdown_v2_character(alert) is None
 
 
-def test_report_escapes_markdown_v2_link_label_and_url_destination():
+def test_report_renders_invalid_repository_url_as_escaped_plain_text():
     ranked = _ranked("owner_(repo)")
     ranked.candidate.html_url = "https://github.com/owner_(repo)"
 
     text = render_report(date(2026, 7, 27), [ranked], [], source_health=[])
 
-    assert "[owner\\_\\(repo\\)](https://github.com/owner_(repo\\))" in text
+    assert "[owner\\_\\(repo\\)](" not in text
+    assert "\\#\\#\\# 1\\. owner\\_\\(repo\\)" in text
+
+
+def test_report_rejects_malformed_repository_url_without_injecting_markdown():
+    ranked = _ranked("owner_repo")
+    ranked.candidate.html_url = "https://github.com/a/b)\n# injected heading"
+
+    text = render_report(date(2026, 7, 27), [ranked], [], source_health=[])
+
+    assert "[owner\\_repo](" not in text
+    assert "owner\\_repo" in text
+    assert "injected heading" not in text
+    assert "https://github.com/a/b" not in text
 
 
 def _first_unescaped_markdown_v2_character(text: str) -> str | None:
