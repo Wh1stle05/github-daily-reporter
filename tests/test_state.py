@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from github_daily_reporter.models import (
+    DeliveryPart,
     QualityReview,
     RankedCandidate,
     ScoreBreakdown,
@@ -224,4 +225,56 @@ def test_initialization_creates_required_tables(tmp_path):
         "run_candidates",
         "ranking_decisions",
         "reports",
+        "report_artifacts",
+        "delivery_parts",
     } <= tables
+
+
+def test_save_report_artifacts_persists_all_payloads_and_timestamp(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    store.save_report_artifacts("run-1", "source", "review", "ranking", "# Report")
+
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT source_json, review_json, ranking_json, markdown, created_at, updated_at "
+            "FROM report_artifacts WHERE run_id = ?",
+            ("run-1",),
+        ).fetchone()
+    assert row[:4] == ("source", "review", "ranking", "# Report")
+    assert row[4] == row[5]
+
+
+def test_delivery_part_round_trip(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message", "digest")
+
+    pending = store.pending_deliveries()
+    assert isinstance(pending[0], DeliveryPart)
+    assert pending[0].body == "message"
+    assert pending[0].digest == "digest"
+    store.mark_delivery_delivered("run-1", 0, "42")
+
+    assert store.pending_deliveries() == []
+
+
+def test_enqueue_delivery_is_idempotent_for_same_digest_and_rejects_changed_digest(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message", "digest")
+    store.enqueue_delivery("run-1", 0, "message", "digest")
+
+    with pytest.raises(ValueError, match="digest"):
+        store.enqueue_delivery("run-1", 0, "changed", "other-digest")
+
+
+def test_delivery_attempt_and_pending_status_are_recorded_without_raw_error(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message", "digest")
+
+    store.record_delivery_attempt("run-1", 0)
+    store.mark_delivery_pending("run-1", 0, "timeout: secret token")
+
+    pending = store.pending_deliveries()[0]
+    assert pending.attempts == 1
+    assert pending.state == "pending"
+    assert pending.error_category == "timeout"

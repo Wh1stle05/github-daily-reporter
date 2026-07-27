@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -5,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from github_daily_reporter.models import (
+    DeliveryPart,
     QualityReview,
     RankedCandidate,
     RepositoryCandidate,
@@ -60,6 +62,28 @@ CREATE TABLE IF NOT EXISTS reports (
   markdown TEXT NOT NULL,
   created_at TEXT NOT NULL,
   delivery_metadata_json TEXT
+);
+CREATE TABLE IF NOT EXISTS report_artifacts (
+  run_id TEXT PRIMARY KEY,
+  source_json TEXT NOT NULL,
+  review_json TEXT NOT NULL,
+  ranking_json TEXT NOT NULL,
+  markdown TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS delivery_parts (
+  run_id TEXT NOT NULL,
+  part_index INTEGER NOT NULL CHECK (part_index >= 0),
+  body TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','delivered')),
+  telegram_message_id TEXT,
+  error_category TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, part_index)
 );
 """
 
@@ -311,6 +335,130 @@ class StateStore:
                     ),
                 )
 
+    def save_report_artifacts(
+        self,
+        run_id: str,
+        source_json: str,
+        review_json: str,
+        ranking_json: str,
+        markdown: str,
+        created_at: datetime | None = None,
+    ) -> None:
+        """Atomically persist the rendered report and its source artifacts."""
+        timestamp = _timestamp(created_at or datetime.now(UTC))
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO report_artifacts "
+                "(run_id, source_json, review_json, ranking_json, markdown, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET "
+                "source_json = excluded.source_json, review_json = excluded.review_json, "
+                "ranking_json = excluded.ranking_json, markdown = excluded.markdown, "
+                "updated_at = excluded.updated_at",
+                (run_id, source_json, review_json, ranking_json, markdown, timestamp, timestamp),
+            )
+
+    def enqueue_delivery(
+        self,
+        run_id: str,
+        part_index: int,
+        body: str,
+        digest: str | None = None,
+    ) -> None:
+        """Queue a Telegram part, rejecting content changes for an existing key."""
+        if part_index < 0:
+            raise ValueError("part_index must be non-negative")
+        actual_digest = digest or hashlib.sha256(body.encode("utf-8")).hexdigest()
+        timestamp = _timestamp(datetime.now(UTC))
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT digest FROM delivery_parts WHERE run_id = ? AND part_index = ?",
+                (run_id, part_index),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != actual_digest:
+                    raise ValueError("delivery digest does not match existing part")
+                return
+            connection.execute(
+                "INSERT INTO delivery_parts "
+                "(run_id, part_index, body, digest, attempts, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 0, 'pending', ?, ?)",
+                (run_id, part_index, body, actual_digest, timestamp, timestamp),
+            )
+
+    def pending_deliveries(self, run_id: str | None = None) -> list[DeliveryPart]:
+        """Return queued parts in stable run and part order."""
+        query = (
+            "SELECT run_id, part_index, body, digest, attempts, state, "
+            "telegram_message_id, error_category, created_at, updated_at "
+            "FROM delivery_parts WHERE state = 'pending'"
+        )
+        parameters: tuple[str, ...] = ()
+        if run_id is not None:
+            query += " AND run_id = ?"
+            parameters = (run_id,)
+        query += " ORDER BY run_id, part_index"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            DeliveryPart(
+                run_id=row[0],
+                part_index=row[1],
+                body=row[2],
+                digest=row[3],
+                attempts=row[4],
+                state=row[5],
+                telegram_message_id=row[6],
+                error_category=row[7],
+                created_at=_parse_timestamp(row[8]),
+                updated_at=_parse_timestamp(row[9]),
+            )
+            for row in rows
+        ]
+
+    def record_delivery_attempt(
+        self, run_id: str, part_index: int, error_category: str | None = None
+    ) -> None:
+        """Increment a part's attempt count and optionally store a safe category."""
+        timestamp = _timestamp(datetime.now(UTC))
+        sanitized = _sanitize_error_category(error_category) if error_category else None
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE delivery_parts SET attempts = attempts + 1, "
+                "error_category = COALESCE(?, error_category), updated_at = ? "
+                "WHERE run_id = ? AND part_index = ?",
+                (sanitized, timestamp, run_id, part_index),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError((run_id, part_index))
+
+    def mark_delivery_delivered(
+        self, run_id: str, part_index: int, telegram_message_id: str
+    ) -> None:
+        timestamp = _timestamp(datetime.now(UTC))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE delivery_parts SET state = 'delivered', telegram_message_id = ?, "
+                "error_category = NULL, updated_at = ? WHERE run_id = ? AND part_index = ?",
+                (telegram_message_id, timestamp, run_id, part_index),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError((run_id, part_index))
+
+    def mark_delivery_pending(
+        self, run_id: str, part_index: int, error_category: str | None = None
+    ) -> None:
+        timestamp = _timestamp(datetime.now(UTC))
+        sanitized = _sanitize_error_category(error_category) if error_category else None
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE delivery_parts SET state = 'pending', telegram_message_id = NULL, "
+                "error_category = ?, updated_at = ? WHERE run_id = ? AND part_index = ?",
+                (sanitized, timestamp, run_id, part_index),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError((run_id, part_index))
+
 
 def _timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
@@ -318,3 +466,24 @@ def _timestamp(value: datetime) -> str:
 
 def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value).astimezone(UTC)
+
+
+_DELIVERY_ERROR_CATEGORIES = {
+    "timeout",
+    "transport",
+    "http_status",
+    "rate_limited",
+    "server_error",
+    "invalid_response",
+    "unknown",
+}
+
+
+def _sanitize_error_category(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    normalized = str(value).strip().lower()
+    for category in _DELIVERY_ERROR_CATEGORIES:
+        if normalized == category or normalized.startswith(category + ":"):
+            return category
+    return "unknown"
