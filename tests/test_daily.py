@@ -356,4 +356,7 @@ async def test_daily_batch_enqueue_failure_leaves_no_partial_parts(tmp_path):
     with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
         await reporter.run(now=NOW)
 
+    with sqlite3.connect(store.path) as connection:
+        artifacts = connection.execute("SELECT 1 FROM report_artifacts").fetchall()
+    assert artifacts == []
     assert store.pending_deliveries() == []

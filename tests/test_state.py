@@ -246,6 +246,33 @@ def test_save_report_artifacts_persists_all_payloads_and_timestamp(tmp_path):
     assert row[4] == row[5]
 
 
+def test_save_report_artifacts_and_enqueue_delivery_rolls_back_everything_on_enqueue_failure(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_second_transactional_delivery_part "
+            "BEFORE INSERT ON delivery_parts WHEN NEW.part_index = 1 "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        store.save_report_artifacts_and_enqueue_delivery(
+            "run-1",
+            "source",
+            "review",
+            "ranking",
+            "# Report",
+            [(0, "first"), (1, "second")],
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        artifacts = connection.execute(
+            "SELECT 1 FROM report_artifacts WHERE run_id = ?", ("run-1",)
+        ).fetchall()
+    assert artifacts == []
+    assert store.pending_deliveries("run-1") == []
+
+
 def test_delivery_part_round_trip(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     digest = hashlib.sha256(b"message").hexdigest()

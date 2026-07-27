@@ -153,7 +153,13 @@ class DailyReporter:
             growth_limit=_limit(self.config, "growth_report_items", 6),
             mature_limit=_limit(self.config, "mature_report_items", 4),
         )
-        self.store.save_report_artifacts(
+        try:
+            parts = split_message(markdown)
+            split_error = None
+        except ValueError as error:
+            parts = [markdown]
+            split_error = str(error)
+        self.store.save_report_artifacts_and_enqueue_delivery(
             envelope.run_id,
             _source_json(candidates, envelope.source_health),
             json.dumps([review.model_dump(mode="json") for review in reviews], ensure_ascii=False, separators=(",", ":")),
@@ -167,9 +173,13 @@ class DailyReporter:
                 separators=(",", ":"),
             ),
             markdown,
+            enumerate(parts),
             observed_at,
         )
-        await self._enqueue_and_deliver(envelope.run_id, markdown)
+        if split_error is not None:
+            self.store.mark_delivery_pending(envelope.run_id, 0, split_error)
+        else:
+            await self._deliver_pending_for_run(envelope.run_id)
         pending = bool(self.store.pending_deliveries(envelope.run_id))
         return DailyRunResult(
             run_id=envelope.run_id,
@@ -200,16 +210,6 @@ class DailyReporter:
                     claimed.run_id, claimed.part_index, str(result), claimed.claim_token
                 )
                 blocked_runs.add(part.run_id)
-
-    async def _enqueue_and_deliver(self, run_id: str, markdown: str) -> None:
-        try:
-            parts = split_message(markdown)
-        except ValueError as error:
-            self.store.enqueue_delivery_batch(run_id, [(0, markdown)])
-            self.store.mark_delivery_pending(run_id, 0, str(error))
-            return
-        self.store.enqueue_delivery_batch(run_id, list(enumerate(parts)))
-        await self._deliver_pending_for_run(run_id)
 
     async def _deliver_pending_for_run(self, run_id: str) -> None:
         for part in self.store.pending_deliveries(run_id):

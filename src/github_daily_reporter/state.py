@@ -384,16 +384,61 @@ class StateStore:
         """Atomically persist the rendered report and its source artifacts."""
         timestamp = _timestamp(created_at or datetime.now(UTC))
         with self._connection() as connection:
-            connection.execute(
-                "INSERT INTO report_artifacts "
-                "(run_id, source_json, review_json, ranking_json, markdown, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(run_id) DO UPDATE SET "
-                "source_json = excluded.source_json, review_json = excluded.review_json, "
-                "ranking_json = excluded.ranking_json, markdown = excluded.markdown, "
-                "updated_at = excluded.updated_at",
-                (run_id, source_json, review_json, ranking_json, markdown, timestamp, timestamp),
+            self._save_report_artifacts(
+                connection,
+                run_id,
+                source_json,
+                review_json,
+                ranking_json,
+                markdown,
+                timestamp,
             )
+
+    def save_report_artifacts_and_enqueue_delivery(
+        self,
+        run_id: str,
+        source_json: str,
+        review_json: str,
+        ranking_json: str,
+        markdown: str,
+        parts: Iterable[tuple[int, str]],
+        created_at: datetime | None = None,
+    ) -> None:
+        """Persist a successful report and every delivery part in one transaction."""
+        prepared = self._prepare_delivery_parts(parts)
+        timestamp = _timestamp(created_at or datetime.now(UTC))
+        with self._connection() as connection:
+            self._save_report_artifacts(
+                connection,
+                run_id,
+                source_json,
+                review_json,
+                ranking_json,
+                markdown,
+                timestamp,
+            )
+            self._enqueue_delivery_parts(connection, run_id, prepared, timestamp)
+
+    @staticmethod
+    def _save_report_artifacts(
+        connection: sqlite3.Connection,
+        run_id: str,
+        source_json: str,
+        review_json: str,
+        ranking_json: str,
+        markdown: str,
+        timestamp: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO report_artifacts "
+            "(run_id, source_json, review_json, ranking_json, markdown, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id) DO UPDATE SET "
+            "source_json = excluded.source_json, review_json = excluded.review_json, "
+            "ranking_json = excluded.ranking_json, markdown = excluded.markdown, "
+            "updated_at = excluded.updated_at",
+            (run_id, source_json, review_json, ranking_json, markdown, timestamp, timestamp),
+        )
 
     def enqueue_delivery(
         self,
@@ -420,6 +465,16 @@ class StateStore:
         Existing same-key, same-content rows are idempotent. Any validation or
         database error rolls back the complete batch, leaving no partial queue.
         """
+        prepared = self._prepare_delivery_parts(parts)
+        if not prepared:
+            return
+        timestamp = _timestamp(datetime.now(UTC))
+        with self._connection() as connection:
+            self._enqueue_delivery_parts(connection, run_id, prepared, timestamp)
+
+    @staticmethod
+    def _prepare_delivery_parts(parts: Iterable[tuple[int, str]]) -> list[tuple[int, str, str]]:
+        """Validate and hash delivery parts before beginning a write transaction."""
         prepared: list[tuple[int, str, str]] = []
         seen_indices: set[int] = set()
         for part_index, body in parts:
@@ -431,25 +486,30 @@ class StateStore:
             prepared.append(
                 (part_index, body, hashlib.sha256(body.encode("utf-8")).hexdigest())
             )
-        if not prepared:
-            return
-        timestamp = _timestamp(datetime.now(UTC))
-        with self._connection() as connection:
-            for part_index, body, digest in prepared:
-                existing = connection.execute(
-                    "SELECT digest FROM delivery_parts WHERE run_id = ? AND part_index = ?",
-                    (run_id, part_index),
-                ).fetchone()
-                if existing is not None:
-                    if existing[0] != digest:
-                        raise ValueError("delivery digest does not match existing part")
-                    continue
-                connection.execute(
-                    "INSERT INTO delivery_parts "
-                    "(run_id, part_index, body, digest, attempts, state, claim_token, claim_deadline, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, 0, 'pending', NULL, NULL, ?, ?)",
-                    (run_id, part_index, body, digest, timestamp, timestamp),
-                )
+        return prepared
+
+    @staticmethod
+    def _enqueue_delivery_parts(
+        connection: sqlite3.Connection,
+        run_id: str,
+        prepared: Iterable[tuple[int, str, str]],
+        timestamp: str,
+    ) -> None:
+        for part_index, body, digest in prepared:
+            existing = connection.execute(
+                "SELECT digest FROM delivery_parts WHERE run_id = ? AND part_index = ?",
+                (run_id, part_index),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != digest:
+                    raise ValueError("delivery digest does not match existing part")
+                continue
+            connection.execute(
+                "INSERT INTO delivery_parts "
+                "(run_id, part_index, body, digest, attempts, state, claim_token, claim_deadline, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, 0, 'pending', NULL, NULL, ?, ?)",
+                (run_id, part_index, body, digest, timestamp, timestamp),
+            )
 
     def pending_deliveries(
         self, run_id: str | None = None, now: datetime | None = None
