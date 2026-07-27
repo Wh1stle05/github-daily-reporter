@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -39,7 +40,38 @@ async def test_telegram_sends_optional_thread_id(respx_mock):
 
     await TelegramClient(_config(telegram_message_thread_id=99)).send("hello")
 
-    assert route.calls[0].request.content == b'{"chat_id":"123","text":"hello","message_thread_id":99}'
+    assert route.calls[0].request.content == (
+        b'{"chat_id":"123","text":"hello","parse_mode":"MarkdownV2","message_thread_id":99}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_telegram_sends_markdown_v2_parse_mode(respx_mock):
+    route = respx_mock.post("https://api.telegram.org/botbot/sendMessage").respond(
+        200, json={"ok": True, "result": {"message_id": 7}}
+    )
+
+    await TelegramClient(_config()).send("hello")
+
+    assert json.loads(route.calls[0].request.content)["parse_mode"] == "MarkdownV2"
+
+
+@pytest.mark.asyncio
+async def test_telegram_honors_429_retry_after_without_capping(monkeypatch, respx_mock):
+    route = respx_mock.post("https://api.telegram.org/botbot/sendMessage")
+    route.side_effect = [
+        httpx.Response(429, json={"parameters": {"retry_after": 45}}),
+        httpx.Response(200, json={"ok": True, "result": {"message_id": 42}}),
+    ]
+    delays = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("github_daily_reporter.telegram.asyncio.sleep", record_sleep)
+
+    assert await TelegramClient(_config()).send("hello") == "42"
+    assert delays == [45]
 
 
 def test_split_message_breaks_only_between_entries():

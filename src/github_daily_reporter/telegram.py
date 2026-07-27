@@ -20,6 +20,7 @@ class TelegramClient:
         payload: dict[str, Any] = {
             "chat_id": str(self.config.telegram_chat_id),
             "text": text,
+            "parse_mode": "MarkdownV2",
         }
         thread_id = getattr(self.config, "telegram_message_thread_id", None)
         if thread_id is not None:
@@ -61,7 +62,7 @@ class TelegramClient:
                 if not retry or attempt >= attempts - 1:
                     return category
                 delay = retry_after if retry_after is not None else base_delay * (2**attempt)
-                await asyncio.sleep(max(0.0, min(delay, 30.0)))
+                await asyncio.sleep(max(0.0, delay))
             return "transport"
         finally:
             if owns_client:
