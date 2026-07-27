@@ -87,8 +87,7 @@ def split_message(text: str, *, limit: int = 3800) -> list[str]:
         if len(block) <= limit:
             current = block
         else:
-            for offset in range(0, len(block), limit):
-                parts.append(block[offset : offset + limit])
+            raise ValueError("message_entry_too_large")
     if current:
         parts.append(current)
     return parts or [""]

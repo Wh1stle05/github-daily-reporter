@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import re
 from typing import Any, Iterable
+from uuid import UUID
 
 
 _SOURCE_LABELS = {
@@ -20,6 +22,25 @@ _MOMENTUM_LABELS = {
     "proxy": "Trending 代理信号",
     "unknown": "未知",
 }
+_ALERT_PHASES = frozenset({"collection", "llm", "ranking", "render", "delivery", "telegram"})
+_ALERT_CATEGORIES = frozenset(
+    {
+        "timeout",
+        "transport",
+        "http_status",
+        "http_429",
+        "http_5xx",
+        "rate_limited",
+        "server_error",
+        "invalid_response",
+        "invalid_json",
+        "invalid_schema",
+        "identity_mismatch",
+        "message_entry_too_large",
+    }
+)
+_ALERT_SOURCE_STATES = frozenset({"success", "degraded", "failed"})
+_MARKDOWN_ESCAPES = str.maketrans({char: f"\\{char}" for char in r"\\_*[]()~`>#+-=|{}.!"})
 
 
 def render_report(
@@ -37,8 +58,8 @@ def render_report(
     text is used only for the two bounded copy fields.
     """
     day = _date_text(report_date)
-    growth = list(ranked_growth)[:growth_limit]
-    mature = list(ranked_mature)[:mature_limit]
+    growth = list(ranked_growth)[: min(max(growth_limit, 0), 6)]
+    mature = list(ranked_mature)[: min(max(mature_limit, 0), 4)]
     lines = [f"# GitHub 每日趋势 · {day}", "", "## 成长项目榜", ""]
     lines.extend(_render_entries(growth))
     lines.extend(["", "## 万星增量榜", ""])
@@ -55,14 +76,19 @@ def render_failure_alert(
     run_id: str, phase: str, category: str, source_health: Iterable[Any]
 ) -> str:
     """Create a sanitized operational alert from identifiers and health only."""
-    lines = ["GitHub 每日趋势任务失败", f"- run_id：{_safe_token(run_id)}", f"- 阶段：{_safe_token(phase)}", f"- 类别：{_safe_token(category)}"]
+    lines = [
+        "GitHub 每日趋势任务失败",
+        f"- run_id：{_safe_run_id(run_id)}",
+        f"- 阶段：{_allowlisted(phase, _ALERT_PHASES)}",
+        f"- 类别：{_allowlisted(category, _ALERT_CATEGORIES)}",
+    ]
     health = list(source_health)
     if health:
         lines.append("- 数据源：")
         for item in health:
-            source = _safe_token(_field(item, "source", "unknown"))
-            status = _safe_token(_field(item, "status", "unknown"))
-            count = _field(item, "item_count", 0)
+            source = _allowlisted(_field(item, "source", "unknown"), _SOURCE_LABELS)
+            status = _allowlisted(_field(item, "status", "unknown"), _ALERT_SOURCE_STATES)
+            count = _safe_count(_field(item, "item_count", 0))
             lines.append(f"  - {source}: {status}（{count} 条）")
     return "\n".join(lines)
 
@@ -139,7 +165,8 @@ def _data_notes(items: list[Any], source_health: Iterable[Any]) -> list[str]:
 
 
 def _copy(review: Any, field: str, fallback: str) -> str:
-    return _safe_text(_field(review, field, fallback), 240 if field == "highlight_zh" else 160) or fallback
+    text = _safe_text(_field(review, field, fallback), 240 if field == "highlight_zh" else 160)
+    return _escape_markdown(text) if text else fallback
 
 
 def _date_text(value: date | datetime | str) -> str:
@@ -168,5 +195,24 @@ def _safe_url(value: Any) -> str:
     return url if url.startswith(("https://", "http://")) else "https://github.com/"
 
 
-def _safe_token(value: Any) -> str:
-    return _safe_text(value, 120).replace("`", "").replace("\"", "")
+def _allowlisted(value: Any, allowed: frozenset[str] | dict[str, str]) -> str:
+    normalized = str(value).strip().lower()
+    return normalized if normalized in allowed else "unknown"
+
+
+def _safe_run_id(value: Any) -> str:
+    run_id = str(value).strip()
+    if re.fullmatch(r"run-\d+", run_id):
+        return run_id
+    try:
+        return str(UUID(run_id))
+    except (TypeError, ValueError, AttributeError):
+        return "unknown"
+
+
+def _safe_count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _escape_markdown(text: str) -> str:
+    return text.translate(_MARKDOWN_ESCAPES)

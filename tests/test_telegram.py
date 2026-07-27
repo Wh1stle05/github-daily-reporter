@@ -48,3 +48,10 @@ def test_split_message_breaks_only_between_entries():
     assert len(parts) == 3
     assert all(len(part) < 3800 for part in parts)
     assert all("### " not in part or part.count("### ") == 1 for part in parts)
+
+
+def test_split_message_rejects_an_entry_that_exceeds_telegram_limit():
+    entry = "### 1. oversized\n" + "x" * 3800
+
+    with pytest.raises(ValueError, match="^message_entry_too_large$"):
+        split_message("## title\n\n" + entry)
