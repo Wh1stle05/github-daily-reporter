@@ -15,6 +15,24 @@ from github_daily_reporter.models import (
 )
 
 
+DELIVERY_PARTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS delivery_parts (
+  run_id TEXT NOT NULL,
+  part_index INTEGER NOT NULL CHECK (part_index >= 0),
+  body TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','in_flight','delivered')),
+  claim_token TEXT,
+  telegram_message_id TEXT,
+  error_category TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, part_index)
+);
+"""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS collection_runs (
   id TEXT PRIMARY KEY,
@@ -72,20 +90,7 @@ CREATE TABLE IF NOT EXISTS report_artifacts (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS delivery_parts (
-  run_id TEXT NOT NULL,
-  part_index INTEGER NOT NULL CHECK (part_index >= 0),
-  body TEXT NOT NULL,
-  digest TEXT NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','delivered')),
-  telegram_message_id TEXT,
-  error_category TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (run_id, part_index)
-);
-"""
+""" + DELIVERY_PARTS_SCHEMA
 
 
 class StateStore:
@@ -103,6 +108,31 @@ class StateStore:
     def _initialize(self) -> None:
         with self._connection() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_delivery_parts(connection)
+
+    @staticmethod
+    def _migrate_delivery_parts(connection: sqlite3.Connection) -> None:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(delivery_parts)")
+        }
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'delivery_parts'"
+        ).fetchone()[0]
+        if "claim_token" in columns and "in_flight" in table_sql:
+            return
+
+        connection.execute("ALTER TABLE delivery_parts RENAME TO delivery_parts_legacy")
+        connection.executescript(DELIVERY_PARTS_SCHEMA)
+        claim_token = "claim_token" if "claim_token" in columns else "NULL"
+        connection.execute(
+            "INSERT INTO delivery_parts "
+            "(run_id, part_index, body, digest, attempts, state, claim_token, "
+            "telegram_message_id, error_category, created_at, updated_at) "
+            "SELECT run_id, part_index, body, digest, attempts, state, "
+            f"{claim_token}, telegram_message_id, error_category, created_at, updated_at "
+            "FROM delivery_parts_legacy"
+        )
+        connection.execute("DROP TABLE delivery_parts_legacy")
 
     def start_run(self, started_at: datetime) -> str:
         run_id = str(uuid4())
@@ -384,8 +414,8 @@ class StateStore:
                 return
             connection.execute(
                 "INSERT INTO delivery_parts "
-                "(run_id, part_index, body, digest, attempts, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 0, 'pending', ?, ?)",
+                "(run_id, part_index, body, digest, attempts, state, claim_token, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 0, 'pending', NULL, ?, ?)",
                 (run_id, part_index, body, actual_digest, timestamp, timestamp),
             )
 
@@ -393,7 +423,7 @@ class StateStore:
         """Return queued parts in stable run and part order."""
         query = (
             "SELECT run_id, part_index, body, digest, attempts, state, "
-            "telegram_message_id, error_category, created_at, updated_at "
+            "claim_token, telegram_message_id, error_category, created_at, updated_at "
             "FROM delivery_parts WHERE state = 'pending'"
         )
         parameters: tuple[str, ...] = ()
@@ -403,21 +433,28 @@ class StateStore:
         query += " ORDER BY run_id, part_index"
         with self._connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
-        return [
-            DeliveryPart(
-                run_id=row[0],
-                part_index=row[1],
-                body=row[2],
-                digest=row[3],
-                attempts=row[4],
-                state=row[5],
-                telegram_message_id=row[6],
-                error_category=row[7],
-                created_at=_parse_timestamp(row[8]),
-                updated_at=_parse_timestamp(row[9]),
+        return [self._delivery_part(row) for row in rows]
+
+    def claim_delivery(self, run_id: str, part_index: int) -> DeliveryPart | None:
+        """Atomically claim one pending part so only its holder may transition it."""
+        claim_token = str(uuid4())
+        timestamp = _timestamp(datetime.now(UTC))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE delivery_parts SET state = 'in_flight', claim_token = ?, "
+                "attempts = attempts + 1, updated_at = ? "
+                "WHERE run_id = ? AND part_index = ? AND state = 'pending' AND claim_token IS NULL",
+                (claim_token, timestamp, run_id, part_index),
             )
-            for row in rows
-        ]
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT run_id, part_index, body, digest, attempts, state, "
+                "claim_token, telegram_message_id, error_category, created_at, updated_at "
+                "FROM delivery_parts WHERE run_id = ? AND part_index = ?",
+                (run_id, part_index),
+            ).fetchone()
+        return self._delivery_part(row)
 
     def record_delivery_attempt(
         self, run_id: str, part_index: int, error_category: str | None = None
@@ -436,31 +473,75 @@ class StateStore:
                 raise KeyError((run_id, part_index))
 
     def mark_delivery_delivered(
-        self, run_id: str, part_index: int, telegram_message_id: str
-    ) -> None:
+        self,
+        run_id: str,
+        part_index: int,
+        telegram_message_id: str,
+        claim_token: str | None = None,
+    ) -> bool:
         timestamp = _timestamp(datetime.now(UTC))
         with self._connection() as connection:
+            where, parameters = _delivery_transition_condition(claim_token)
             cursor = connection.execute(
                 "UPDATE delivery_parts SET state = 'delivered', telegram_message_id = ?, "
-                "error_category = NULL, updated_at = ? WHERE run_id = ? AND part_index = ?",
-                (telegram_message_id, timestamp, run_id, part_index),
+                "claim_token = NULL, error_category = NULL, updated_at = ? "
+                f"WHERE run_id = ? AND part_index = ? AND {where}",
+                (telegram_message_id, timestamp, run_id, part_index, *parameters),
             )
             if cursor.rowcount == 0:
-                raise KeyError((run_id, part_index))
+                if not self._delivery_exists(connection, run_id, part_index):
+                    raise KeyError((run_id, part_index))
+                return False
+        return True
 
     def mark_delivery_pending(
-        self, run_id: str, part_index: int, error_category: str | None = None
-    ) -> None:
+        self,
+        run_id: str,
+        part_index: int,
+        error_category: str | None = None,
+        claim_token: str | None = None,
+    ) -> bool:
         timestamp = _timestamp(datetime.now(UTC))
         sanitized = _sanitize_error_category(error_category) if error_category else None
         with self._connection() as connection:
+            where, parameters = _delivery_transition_condition(claim_token)
             cursor = connection.execute(
                 "UPDATE delivery_parts SET state = 'pending', telegram_message_id = NULL, "
-                "error_category = ?, updated_at = ? WHERE run_id = ? AND part_index = ?",
-                (sanitized, timestamp, run_id, part_index),
+                "claim_token = NULL, error_category = ?, updated_at = ? "
+                f"WHERE run_id = ? AND part_index = ? AND {where}",
+                (sanitized, timestamp, run_id, part_index, *parameters),
             )
             if cursor.rowcount == 0:
-                raise KeyError((run_id, part_index))
+                if not self._delivery_exists(connection, run_id, part_index):
+                    raise KeyError((run_id, part_index))
+                return False
+        return True
+
+    @staticmethod
+    def _delivery_part(row: tuple[object, ...]) -> DeliveryPart:
+        return DeliveryPart(
+            run_id=row[0],
+            part_index=row[1],
+            body=row[2],
+            digest=row[3],
+            attempts=row[4],
+            state=row[5],
+            claim_token=row[6],
+            telegram_message_id=row[7],
+            error_category=row[8],
+            created_at=_parse_timestamp(row[9]),
+            updated_at=_parse_timestamp(row[10]),
+        )
+
+    @staticmethod
+    def _delivery_exists(connection: sqlite3.Connection, run_id: str, part_index: int) -> bool:
+        return (
+            connection.execute(
+                "SELECT 1 FROM delivery_parts WHERE run_id = ? AND part_index = ?",
+                (run_id, part_index),
+            ).fetchone()
+            is not None
+        )
 
 
 def _timestamp(value: datetime) -> str:
@@ -490,3 +571,9 @@ def _sanitize_error_category(value: str | None) -> str:
         if normalized == category or normalized.startswith(category + ":"):
             return category
     return "unknown"
+
+
+def _delivery_transition_condition(claim_token: str | None) -> tuple[str, tuple[str, ...]]:
+    if claim_token is None:
+        return "state = 'pending' AND claim_token IS NULL", ()
+    return "state = 'in_flight' AND claim_token = ?", (claim_token,)

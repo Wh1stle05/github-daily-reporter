@@ -288,3 +288,39 @@ def test_delivery_attempt_and_pending_status_are_recorded_without_raw_error(tmp_
     assert pending.attempts == 1
     assert pending.state == "pending"
     assert pending.error_category == "timeout"
+
+
+def test_delivery_claim_allows_only_one_overlapping_reporter(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+
+    first_claim = store.claim_delivery("run-1", 0)
+    second_claim = store.claim_delivery("run-1", 0)
+
+    assert first_claim is not None
+    assert first_claim.state == "in_flight"
+    assert first_claim.claim_token is not None
+    assert first_claim.attempts == 1
+    assert second_claim is None
+    assert store.pending_deliveries() == []
+
+
+def test_stale_claim_failure_cannot_requeue_a_later_delivery(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+    first_claim = store.claim_delivery("run-1", 0)
+    assert first_claim is not None
+
+    assert store.mark_delivery_pending(
+        "run-1", 0, "timeout", first_claim.claim_token
+    )
+    second_claim = store.claim_delivery("run-1", 0)
+    assert second_claim is not None
+    assert store.mark_delivery_delivered(
+        "run-1", 0, "42", second_claim.claim_token
+    )
+
+    assert not store.mark_delivery_pending(
+        "run-1", 0, "timeout", first_claim.claim_token
+    )
+    assert store.pending_deliveries() == []
