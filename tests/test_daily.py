@@ -332,3 +332,28 @@ async def test_multi_part_delivery_stops_after_the_first_failed_part(tmp_path):
     assert result.status == "delivery_pending"
     assert telegram.sent == [first_part]
     assert [(part.part_index, part.attempts) for part in pending] == [(0, 1), (1, 0)]
+
+
+@pytest.mark.asyncio
+async def test_daily_batch_enqueue_failure_leaves_no_partial_parts(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_second_daily_part "
+            "BEFORE INSERT ON delivery_parts WHEN NEW.part_index = 1 "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        )
+    first_part = "a" * 3_000
+    second_part = "b" * 3_000
+    reporter = DailyReporter(
+        collector=FakeCollector(store, [_candidate("growth/repo", 100)]),
+        llm=FakeLlm(),
+        telegram=FakeTelegram(),
+        store=store,
+        renderer=lambda *args, **kwargs: f"{first_part}\n\n{second_part}",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        await reporter.run(now=NOW)
+
+    assert store.pending_deliveries() == []

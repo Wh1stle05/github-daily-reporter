@@ -205,11 +205,10 @@ class DailyReporter:
         try:
             parts = split_message(markdown)
         except ValueError as error:
-            self.store.enqueue_delivery(run_id, 0, markdown)
+            self.store.enqueue_delivery_batch(run_id, [(0, markdown)])
             self.store.mark_delivery_pending(run_id, 0, str(error))
             return
-        for index, body in enumerate(parts):
-            self.store.enqueue_delivery(run_id, index, body)
+        self.store.enqueue_delivery_batch(run_id, list(enumerate(parts)))
         await self._deliver_pending_for_run(run_id)
 
     async def _deliver_pending_for_run(self, run_id: str) -> None:

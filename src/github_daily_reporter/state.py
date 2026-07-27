@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -407,23 +408,48 @@ class StateStore:
         expected_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         if digest is not None and digest != expected_digest:
             raise ValueError("digest must match SHA-256 of delivery body")
-        actual_digest = expected_digest
+        self.enqueue_delivery_batch(run_id, [(part_index, body)])
+
+    def enqueue_delivery_batch(
+        self,
+        run_id: str,
+        parts: Iterable[tuple[int, str]],
+    ) -> None:
+        """Atomically queue all Telegram parts for a report.
+
+        Existing same-key, same-content rows are idempotent. Any validation or
+        database error rolls back the complete batch, leaving no partial queue.
+        """
+        prepared: list[tuple[int, str, str]] = []
+        seen_indices: set[int] = set()
+        for part_index, body in parts:
+            if part_index < 0:
+                raise ValueError("part_index must be non-negative")
+            if part_index in seen_indices:
+                raise ValueError("duplicate delivery part index")
+            seen_indices.add(part_index)
+            prepared.append(
+                (part_index, body, hashlib.sha256(body.encode("utf-8")).hexdigest())
+            )
+        if not prepared:
+            return
         timestamp = _timestamp(datetime.now(UTC))
         with self._connection() as connection:
-            existing = connection.execute(
-                "SELECT digest FROM delivery_parts WHERE run_id = ? AND part_index = ?",
-                (run_id, part_index),
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != actual_digest:
-                    raise ValueError("delivery digest does not match existing part")
-                return
-            connection.execute(
-                "INSERT INTO delivery_parts "
-                "(run_id, part_index, body, digest, attempts, state, claim_token, claim_deadline, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, 0, 'pending', NULL, NULL, ?, ?)",
-                (run_id, part_index, body, actual_digest, timestamp, timestamp),
-            )
+            for part_index, body, digest in prepared:
+                existing = connection.execute(
+                    "SELECT digest FROM delivery_parts WHERE run_id = ? AND part_index = ?",
+                    (run_id, part_index),
+                ).fetchone()
+                if existing is not None:
+                    if existing[0] != digest:
+                        raise ValueError("delivery digest does not match existing part")
+                    continue
+                connection.execute(
+                    "INSERT INTO delivery_parts "
+                    "(run_id, part_index, body, digest, attempts, state, claim_token, claim_deadline, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, 0, 'pending', NULL, NULL, ?, ?)",
+                    (run_id, part_index, body, digest, timestamp, timestamp),
+                )
 
     def pending_deliveries(
         self, run_id: str | None = None, now: datetime | None = None
@@ -464,7 +490,13 @@ class StateStore:
             cursor = connection.execute(
                 "UPDATE delivery_parts SET state = 'in_flight', claim_token = ?, claim_deadline = ?, "
                 "attempts = attempts + 1, updated_at = ? "
-                "WHERE run_id = ? AND part_index = ? AND state = 'pending' AND claim_token IS NULL",
+                "WHERE run_id = ? AND part_index = ? AND state = 'pending' AND claim_token IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM delivery_parts AS predecessor "
+                "WHERE predecessor.run_id = delivery_parts.run_id "
+                "AND predecessor.part_index < delivery_parts.part_index "
+                "AND predecessor.state IN ('pending', 'in_flight')"
+                ")",
                 (claim_token, claim_deadline, timestamp, run_id, part_index),
             )
             if cursor.rowcount == 0:
@@ -589,6 +621,9 @@ _DELIVERY_ERROR_CATEGORIES = {
     "http_status",
     "rate_limited",
     "server_error",
+    "http_429",
+    "http_5xx",
+    "message_entry_too_large",
     "invalid_response",
     "unknown",
 }

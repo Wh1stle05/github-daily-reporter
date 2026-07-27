@@ -305,6 +305,45 @@ def test_delivery_claim_allows_only_one_overlapping_reporter(tmp_path):
     assert store.pending_deliveries() == []
 
 
+def test_delivery_claim_blocks_later_part_until_all_predecessors_delivered(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery_batch("run-1", [(0, "first"), (1, "second")])
+
+    assert store.claim_delivery("run-1", 1) is None
+    first_claim = store.claim_delivery("run-1", 0)
+    assert first_claim is not None
+    assert store.claim_delivery("run-1", 1) is None
+
+    assert store.mark_delivery_delivered("run-1", 0, "42", first_claim.claim_token)
+    second_claim = store.claim_delivery("run-1", 1)
+    assert second_claim is not None
+
+
+def test_enqueue_delivery_batch_rolls_back_all_parts_on_insert_failure(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_second_delivery_part "
+            "BEFORE INSERT ON delivery_parts WHEN NEW.part_index = 1 "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        store.enqueue_delivery_batch("run-1", [(0, "first"), (1, "second")])
+
+    assert store.pending_deliveries("run-1") == []
+
+
+@pytest.mark.parametrize("category", ["http_429", "http_5xx", "message_entry_too_large"])
+def test_delivery_failure_categories_are_persisted_stably(tmp_path, category):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+
+    store.mark_delivery_pending("run-1", 0, category)
+
+    assert store.pending_deliveries("run-1")[0].error_category == category
+
+
 def test_stale_claim_failure_cannot_requeue_a_later_delivery(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     store.enqueue_delivery("run-1", 0, "message")
