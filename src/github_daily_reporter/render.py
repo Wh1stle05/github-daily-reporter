@@ -60,15 +60,15 @@ def render_report(
     day = _date_text(report_date)
     growth = list(ranked_growth)[: min(max(growth_limit, 0), 6)]
     mature = list(ranked_mature)[: min(max(mature_limit, 0), 4)]
-    lines = [f"# GitHub 每日趋势 · {day}", "", "## 成长项目榜", ""]
+    lines = [_escape_markdown(f"# GitHub 每日趋势 · {day}"), "", _escape_markdown("## 成长项目榜"), ""]
     lines.extend(_render_entries(growth))
-    lines.extend(["", "## 万星增量榜", ""])
+    lines.extend(["", _escape_markdown("## 万星增量榜"), ""])
     lines.extend(_render_entries(mature))
 
     notes = _data_notes([*growth, *mature], source_health)
     if notes:
-        lines.extend(["", "## 数据说明", ""])
-        lines.extend(f"- {note}" for note in notes)
+        lines.extend(["", _escape_markdown("## 数据说明"), ""])
+        lines.extend(_escape_markdown(f"- {note}") for note in notes)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -78,18 +78,18 @@ def render_failure_alert(
     """Create a sanitized operational alert from identifiers and health only."""
     lines = [
         "GitHub 每日趋势任务失败",
-        f"- run_id：{_safe_run_id(run_id)}",
-        f"- 阶段：{_allowlisted(phase, _ALERT_PHASES)}",
-        f"- 类别：{_allowlisted(category, _ALERT_CATEGORIES)}",
+        _escape_markdown(f"- run_id：{_safe_run_id(run_id)}"),
+        _escape_markdown(f"- 阶段：{_allowlisted(phase, _ALERT_PHASES)}"),
+        _escape_markdown(f"- 类别：{_allowlisted(category, _ALERT_CATEGORIES)}"),
     ]
     health = list(source_health)
     if health:
-        lines.append("- 数据源：")
+        lines.append(_escape_markdown("- 数据源："))
         for item in health:
             source = _allowlisted(_field(item, "source", "unknown"), _SOURCE_LABELS)
             status = _allowlisted(_field(item, "status", "unknown"), _ALERT_SOURCE_STATES)
             count = _safe_count(_field(item, "item_count", 0))
-            lines.append(f"  - {source}: {status}（{count} 条）")
+            lines.append("  " + _escape_markdown(f"- {source}: {status}（{count} 条）"))
     return "\n".join(lines)
 
 
@@ -104,11 +104,11 @@ def _render_entries(items: list[Any]) -> list[str]:
         highlight = _copy(review, "highlight_zh", "暂无特别看点")
         lines.extend(
             [
-                f"### {index}. [{name}]({url})",
-                summary,
-                f"- 信号：{_signal(candidate, ranked)}",
-                f"- 看点：{highlight}",
-                f"- 技术：{_technology(candidate)}",
+                f"\\#\\#\\# {index}\\. [{_escape_markdown(name)}]({_escape_link_url(url)})",
+                _escape_markdown(summary),
+                _escape_markdown(f"- 信号：{_signal(candidate, ranked)}"),
+                _escape_markdown(f"- 看点：{highlight}"),
+                _escape_markdown(f"- 技术：{_technology(candidate)}"),
                 "",
             ]
         )
@@ -166,7 +166,7 @@ def _data_notes(items: list[Any], source_health: Iterable[Any]) -> list[str]:
 
 def _copy(review: Any, field: str, fallback: str) -> str:
     text = _safe_text(_field(review, field, fallback), 240 if field == "highlight_zh" else 160)
-    return _escape_markdown(text) if text else fallback
+    return text or fallback
 
 
 def _date_text(value: date | datetime | str) -> str:
@@ -193,6 +193,10 @@ def _safe_text(value: Any, limit: int) -> str:
 def _safe_url(value: Any) -> str:
     url = str(value or "")
     return url if url.startswith(("https://", "http://")) else "https://github.com/"
+
+
+def _escape_link_url(url: str) -> str:
+    return url.replace("\\", "\\\\").replace(")", "\\)")
 
 
 def _allowlisted(value: Any, allowed: frozenset[str] | dict[str, str]) -> str:

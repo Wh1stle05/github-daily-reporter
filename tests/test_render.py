@@ -29,9 +29,9 @@ def test_render_report_has_two_ordered_cohort_sections_and_limits_items():
 
     text = render_report(date(2026, 7, 27), growth, mature, source_health=[])
 
-    assert "# GitHub 每日趋势 · 2026-07-27" in text
-    assert "## 成长项目榜" in text
-    assert "## 万星增量榜" in text
+    assert "\\# GitHub 每日趋势 · 2026\\-07\\-27" in text
+    assert "\\#\\# 成长项目榜" in text
+    assert "\\#\\# 万星增量榜" in text
     assert text.index("growth/repo0") < text.index("growth/repo1")
     assert "growth/repo6" not in text
     assert "mature/repo4" not in text
@@ -59,19 +59,19 @@ def test_render_report_hard_caps_cohorts_when_caller_requests_larger_limits():
 def test_render_report_data_notes_only_when_needed():
     healthy = [_ranked("owner/repo")]
     text = render_report(date(2026, 7, 27), healthy, [], source_health=[])
-    assert "## 数据说明" not in text
+    assert "\\#\\# 数据说明" not in text
 
     degraded = render_report(
         date(2026, 7, 27), healthy, [],
         source_health=[SimpleNamespace(source="trending", status="degraded", item_count=1)],
     )
-    assert "## 数据说明" in degraded
+    assert "\\#\\# 数据说明" in degraded
     assert "trending" in degraded
 
     estimated = render_report(
         date(2026, 7, 27), [_ranked("owner/repo", momentum_source="snapshot_estimate")], [], source_health=[]
     )
-    assert "## 数据说明" in estimated
+    assert "\\#\\# 数据说明" in estimated
     assert "估算" in estimated
 
 
@@ -80,9 +80,9 @@ def test_failure_alert_excludes_raw_error_and_secrets():
         "run-123", "llm", "timeout",
         [SimpleNamespace(source="github_search", status="failed", item_count=0, error="Bearer super-secret")],
     )
-    assert "run-123" in alert
+    assert "run\\-123" in alert
     assert "llm" in alert and "timeout" in alert
-    assert "github_search" in alert
+    assert "github\\_search" in alert
     assert "super-secret" not in alert
     assert "Bearer" not in alert
 
@@ -100,10 +100,68 @@ def test_failure_alert_allowlists_caller_controlled_identifiers():
     assert hostile not in alert
     assert "super-secret" not in alert
     assert "attacker.invalid" not in alert
-    assert "run_id：unknown" in alert
+    assert "run\\_id：unknown" in alert
     assert "阶段：unknown" in alert
     assert "类别：unknown" in alert
     assert "unknown: unknown（0 条）" in alert
+
+
+def test_report_escapes_markdown_v2_text_but_preserves_repository_link():
+    ranked = _ranked("owner_repo", momentum_source="snapshot_estimate")
+    ranked.candidate.primary_language = "C++"
+    ranked.candidate.license_spdx = "Apache-2.0"
+
+    text = render_report(
+        date(2026, 7, 27),
+        [ranked],
+        [],
+        source_health=[SimpleNamespace(source="trending", status="degraded", item_count=1)],
+    )
+
+    link = "[owner\\_repo](https://github.com/owner_repo)"
+    assert link in text
+    assert "\\# GitHub 每日趋势 · 2026\\-07\\-27" in text
+    assert "\\#\\#\\# 1\\. " + link in text
+    assert "\\- 信号：24 小时 \\+12" in text
+    assert "\\- 技术：C\\+\\+ · Apache\\-2\\.0" in text
+    assert "部分项目的增量来自历史快照估算。" in text
+    assert _first_unescaped_markdown_v2_character(text.replace(link, "")) is None
+
+
+def test_failure_alert_escapes_markdown_v2_literals_and_allowlisted_values():
+    alert = render_failure_alert(
+        "run-123",
+        "llm",
+        "timeout",
+        [SimpleNamespace(source="github_search", status="failed", item_count=0)],
+    )
+
+    assert "\\- run\\_id：run\\-123" in alert
+    assert "\\- 数据源：" in alert
+    assert "  \\- github\\_search: failed（0 条）" in alert
+    assert _first_unescaped_markdown_v2_character(alert) is None
+
+
+def test_report_escapes_markdown_v2_link_label_and_url_destination():
+    ranked = _ranked("owner_(repo)")
+    ranked.candidate.html_url = "https://github.com/owner_(repo)"
+
+    text = render_report(date(2026, 7, 27), [ranked], [], source_health=[])
+
+    assert "[owner\\_\\(repo\\)](https://github.com/owner_(repo\\))" in text
+
+
+def _first_unescaped_markdown_v2_character(text: str) -> str | None:
+    reserved = r"_*[]()~`>#+-=|{}.!"
+    index = 0
+    while index < len(text):
+        if text[index] == "\\" and index + 1 < len(text):
+            index += 2
+        elif text[index] in reserved:
+            return text[index]
+        else:
+            index += 1
+    return None
 
 
 def test_render_escapes_markdown_from_llm_copy():
@@ -118,3 +176,4 @@ def test_render_escapes_markdown_from_llm_copy():
     assert "[model link](https://attacker.invalid)" not in text
     assert "\\[model link\\]\\(https://attacker\\.invalid\\)" in text
     assert "\\# fake heading" in text
+    assert r"\\\# fake heading" not in text
