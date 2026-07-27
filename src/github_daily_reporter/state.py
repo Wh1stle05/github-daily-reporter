@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS delivery_parts (
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','in_flight','delivered')),
   claim_token TEXT,
+  claim_deadline TEXT,
   telegram_message_id TEXT,
   error_category TEXT,
   created_at TEXT NOT NULL,
@@ -118,19 +119,24 @@ class StateStore:
         table_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'delivery_parts'"
         ).fetchone()[0]
-        if "claim_token" in columns and "in_flight" in table_sql:
+        if {"claim_token", "claim_deadline"} <= columns and "in_flight" in table_sql:
             return
 
         connection.execute("ALTER TABLE delivery_parts RENAME TO delivery_parts_legacy")
         connection.executescript(DELIVERY_PARTS_SCHEMA)
         claim_token = "claim_token" if "claim_token" in columns else "NULL"
+        claim_deadline = "claim_deadline" if "claim_deadline" in columns else "NULL"
         connection.execute(
             "INSERT INTO delivery_parts "
-            "(run_id, part_index, body, digest, attempts, state, claim_token, "
+            "(run_id, part_index, body, digest, attempts, state, claim_token, claim_deadline, "
             "telegram_message_id, error_category, created_at, updated_at) "
             "SELECT run_id, part_index, body, digest, attempts, state, "
-            f"{claim_token}, telegram_message_id, error_category, created_at, updated_at "
+            f"{claim_token}, {claim_deadline}, telegram_message_id, error_category, created_at, updated_at "
             "FROM delivery_parts_legacy"
+        )
+        connection.execute(
+            "UPDATE delivery_parts SET state = 'pending', claim_token = NULL "
+            "WHERE state = 'in_flight' AND claim_deadline IS NULL"
         )
         connection.execute("DROP TABLE delivery_parts_legacy")
 
@@ -414,16 +420,19 @@ class StateStore:
                 return
             connection.execute(
                 "INSERT INTO delivery_parts "
-                "(run_id, part_index, body, digest, attempts, state, claim_token, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 0, 'pending', NULL, ?, ?)",
+                "(run_id, part_index, body, digest, attempts, state, claim_token, claim_deadline, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, 0, 'pending', NULL, NULL, ?, ?)",
                 (run_id, part_index, body, actual_digest, timestamp, timestamp),
             )
 
-    def pending_deliveries(self, run_id: str | None = None) -> list[DeliveryPart]:
+    def pending_deliveries(
+        self, run_id: str | None = None, now: datetime | None = None
+    ) -> list[DeliveryPart]:
         """Return queued parts in stable run and part order."""
+        timestamp = _timestamp(now or datetime.now(UTC))
         query = (
             "SELECT run_id, part_index, body, digest, attempts, state, "
-            "claim_token, telegram_message_id, error_category, created_at, updated_at "
+            "claim_token, claim_deadline, telegram_message_id, error_category, created_at, updated_at "
             "FROM delivery_parts WHERE state = 'pending'"
         )
         parameters: tuple[str, ...] = ()
@@ -432,25 +441,37 @@ class StateStore:
             parameters = (run_id,)
         query += " ORDER BY run_id, part_index"
         with self._connection() as connection:
+            self._reclaim_expired_deliveries(connection, timestamp)
             rows = connection.execute(query, parameters).fetchall()
         return [self._delivery_part(row) for row in rows]
 
-    def claim_delivery(self, run_id: str, part_index: int) -> DeliveryPart | None:
+    def claim_delivery(
+        self,
+        run_id: str,
+        part_index: int,
+        now: datetime | None = None,
+        lease_seconds: int = 300,
+    ) -> DeliveryPart | None:
         """Atomically claim one pending part so only its holder may transition it."""
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         claim_token = str(uuid4())
-        timestamp = _timestamp(datetime.now(UTC))
+        claimed_at = now or datetime.now(UTC)
+        timestamp = _timestamp(claimed_at)
+        claim_deadline = _timestamp(claimed_at + timedelta(seconds=lease_seconds))
         with self._connection() as connection:
+            self._reclaim_expired_deliveries(connection, timestamp)
             cursor = connection.execute(
-                "UPDATE delivery_parts SET state = 'in_flight', claim_token = ?, "
+                "UPDATE delivery_parts SET state = 'in_flight', claim_token = ?, claim_deadline = ?, "
                 "attempts = attempts + 1, updated_at = ? "
                 "WHERE run_id = ? AND part_index = ? AND state = 'pending' AND claim_token IS NULL",
-                (claim_token, timestamp, run_id, part_index),
+                (claim_token, claim_deadline, timestamp, run_id, part_index),
             )
             if cursor.rowcount == 0:
                 return None
             row = connection.execute(
                 "SELECT run_id, part_index, body, digest, attempts, state, "
-                "claim_token, telegram_message_id, error_category, created_at, updated_at "
+                "claim_token, claim_deadline, telegram_message_id, error_category, created_at, updated_at "
                 "FROM delivery_parts WHERE run_id = ? AND part_index = ?",
                 (run_id, part_index),
             ).fetchone()
@@ -484,7 +505,7 @@ class StateStore:
             where, parameters = _delivery_transition_condition(claim_token)
             cursor = connection.execute(
                 "UPDATE delivery_parts SET state = 'delivered', telegram_message_id = ?, "
-                "claim_token = NULL, error_category = NULL, updated_at = ? "
+                "claim_token = NULL, claim_deadline = NULL, error_category = NULL, updated_at = ? "
                 f"WHERE run_id = ? AND part_index = ? AND {where}",
                 (telegram_message_id, timestamp, run_id, part_index, *parameters),
             )
@@ -507,7 +528,7 @@ class StateStore:
             where, parameters = _delivery_transition_condition(claim_token)
             cursor = connection.execute(
                 "UPDATE delivery_parts SET state = 'pending', telegram_message_id = NULL, "
-                "claim_token = NULL, error_category = ?, updated_at = ? "
+                "claim_token = NULL, claim_deadline = NULL, error_category = ?, updated_at = ? "
                 f"WHERE run_id = ? AND part_index = ? AND {where}",
                 (sanitized, timestamp, run_id, part_index, *parameters),
             )
@@ -527,10 +548,11 @@ class StateStore:
             attempts=row[4],
             state=row[5],
             claim_token=row[6],
-            telegram_message_id=row[7],
-            error_category=row[8],
-            created_at=_parse_timestamp(row[9]),
-            updated_at=_parse_timestamp(row[10]),
+            claim_deadline=_parse_timestamp(row[7]) if row[7] is not None else None,
+            telegram_message_id=row[8],
+            error_category=row[9],
+            created_at=_parse_timestamp(row[10]),
+            updated_at=_parse_timestamp(row[11]),
         )
 
     @staticmethod
@@ -541,6 +563,15 @@ class StateStore:
                 (run_id, part_index),
             ).fetchone()
             is not None
+        )
+
+    @staticmethod
+    def _reclaim_expired_deliveries(connection: sqlite3.Connection, timestamp: str) -> None:
+        connection.execute(
+            "UPDATE delivery_parts SET state = 'pending', claim_token = NULL, "
+            "claim_deadline = NULL, updated_at = ? "
+            "WHERE state = 'in_flight' AND claim_deadline IS NOT NULL AND claim_deadline <= ?",
+            (timestamp, timestamp),
         )
 
 

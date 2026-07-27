@@ -163,6 +163,7 @@ class DeliveryPart(BaseModel):
     attempts: int = Field(default=0, ge=0)
     state: Literal["pending", "in_flight", "delivered"] = "pending"
     claim_token: str | None = None
+    claim_deadline: datetime | None = None
     telegram_message_id: str | None = None
     error_category: str | None = None
     created_at: datetime | None = None

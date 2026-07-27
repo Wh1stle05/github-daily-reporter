@@ -324,3 +324,19 @@ def test_stale_claim_failure_cannot_requeue_a_later_delivery(tmp_path):
         "run-1", 0, "timeout", first_claim.claim_token
     )
     assert store.pending_deliveries() == []
+
+
+def test_expired_delivery_claim_is_reclaimed_while_active_claim_stays_hidden(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+    claimed_at = datetime(2026, 7, 27, 12, tzinfo=UTC)
+    claim = store.claim_delivery("run-1", 0, now=claimed_at, lease_seconds=60)
+    assert claim is not None
+
+    assert store.pending_deliveries(now=claimed_at + timedelta(seconds=59)) == []
+    reclaimed = store.pending_deliveries(now=claimed_at + timedelta(seconds=61))
+
+    assert len(reclaimed) == 1
+    assert reclaimed[0].state == "pending"
+    assert reclaimed[0].claim_token is None
+    assert store.claim_delivery("run-1", 0, now=claimed_at + timedelta(seconds=61)) is not None
