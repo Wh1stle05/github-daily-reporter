@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import hashlib
 import sqlite3
 
 import pytest
@@ -247,12 +248,13 @@ def test_save_report_artifacts_persists_all_payloads_and_timestamp(tmp_path):
 
 def test_delivery_part_round_trip(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
-    store.enqueue_delivery("run-1", 0, "message", "digest")
+    digest = hashlib.sha256(b"message").hexdigest()
+    store.enqueue_delivery("run-1", 0, "message", digest)
 
     pending = store.pending_deliveries()
     assert isinstance(pending[0], DeliveryPart)
     assert pending[0].body == "message"
-    assert pending[0].digest == "digest"
+    assert pending[0].digest == digest
     store.mark_delivery_delivered("run-1", 0, "42")
 
     assert store.pending_deliveries() == []
@@ -260,16 +262,24 @@ def test_delivery_part_round_trip(tmp_path):
 
 def test_enqueue_delivery_is_idempotent_for_same_digest_and_rejects_changed_digest(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
-    store.enqueue_delivery("run-1", 0, "message", "digest")
-    store.enqueue_delivery("run-1", 0, "message", "digest")
+    digest = hashlib.sha256(b"message").hexdigest()
+    store.enqueue_delivery("run-1", 0, "message", digest)
+    store.enqueue_delivery("run-1", 0, "message", digest)
 
     with pytest.raises(ValueError, match="digest"):
         store.enqueue_delivery("run-1", 0, "changed", "other-digest")
 
 
+def test_enqueue_delivery_rejects_digest_not_derived_from_body(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        store.enqueue_delivery("run-1", 0, "message", "digest")
+
+
 def test_delivery_attempt_and_pending_status_are_recorded_without_raw_error(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
-    store.enqueue_delivery("run-1", 0, "message", "digest")
+    store.enqueue_delivery("run-1", 0, "message", hashlib.sha256(b"message").hexdigest())
 
     store.record_delivery_attempt("run-1", 0)
     store.mark_delivery_pending("run-1", 0, "timeout: secret token")

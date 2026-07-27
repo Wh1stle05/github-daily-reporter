@@ -368,7 +368,10 @@ class StateStore:
         """Queue a Telegram part, rejecting content changes for an existing key."""
         if part_index < 0:
             raise ValueError("part_index must be non-negative")
-        actual_digest = digest or hashlib.sha256(body.encode("utf-8")).hexdigest()
+        expected_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if digest is not None and digest != expected_digest:
+            raise ValueError("digest must match SHA-256 of delivery body")
+        actual_digest = expected_digest
         timestamp = _timestamp(datetime.now(UTC))
         with self._connection() as connection:
             existing = connection.execute(
