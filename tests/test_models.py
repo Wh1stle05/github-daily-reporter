@@ -10,7 +10,9 @@ from github_daily_reporter.models import (
     LlmReview,
     LlmReviewEnvelope,
     QualityEnvelope,
+    RankedCandidate,
     RepositoryCandidate,
+    ScoreBreakdown,
     SourceObservation,
 )
 
@@ -157,3 +159,49 @@ def test_direct_runtime_result_and_delivery_contracts() -> None:
     assert result.mature == []
     assert delivery.state == "pending"
     assert delivery.attempts == 0
+
+
+def test_ranked_candidate_accepts_cohort_score_breakdown() -> None:
+    candidate = RepositoryCandidate(
+        canonical_name="owner/repo",
+        full_name="Owner/Repo",
+        html_url="https://github.com/Owner/Repo",
+        created_at=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+    score = CohortScoreBreakdown(
+        cohort="growth",
+        momentum_source="exact",
+        momentum=80,
+        evidence=50,
+        quality=75,
+        activity=100,
+        hacker_news=20,
+        popularity=30,
+        final=70,
+    )
+
+    ranked = RankedCandidate(candidate=candidate, score=score)
+
+    assert ranked.score == score
+
+
+def test_ranked_candidate_keeps_accepting_legacy_score_breakdown() -> None:
+    candidate = RepositoryCandidate(
+        canonical_name="owner/repo",
+        full_name="Owner/Repo",
+        html_url="https://github.com/Owner/Repo",
+        created_at=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+    score = ScoreBreakdown(
+        momentum=80,
+        evidence=50,
+        freshness=100,
+        hacker_news=20,
+        quality=75,
+        popularity=30,
+        final=70,
+    )
+
+    ranked = RankedCandidate(candidate=candidate, score=score)
+
+    assert ranked.score == score

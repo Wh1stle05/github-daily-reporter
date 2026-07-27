@@ -139,7 +139,7 @@ class CohortScoreBreakdown(BaseModel):
 
 class RankedCandidate(BaseModel):
     candidate: RepositoryCandidate
-    score: ScoreBreakdown
+    score: ScoreBreakdown | CohortScoreBreakdown
     quality_degraded: bool = False
 
 
