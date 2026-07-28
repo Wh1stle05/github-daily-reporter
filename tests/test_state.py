@@ -1,9 +1,11 @@
 from datetime import UTC, datetime, timedelta
+import hashlib
 import sqlite3
 
 import pytest
 
 from github_daily_reporter.models import (
+    DeliveryPart,
     QualityReview,
     RankedCandidate,
     ScoreBreakdown,
@@ -224,4 +226,183 @@ def test_initialization_creates_required_tables(tmp_path):
         "run_candidates",
         "ranking_decisions",
         "reports",
+        "report_artifacts",
+        "delivery_parts",
     } <= tables
+
+
+def test_save_report_artifacts_persists_all_payloads_and_timestamp(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    store.save_report_artifacts("run-1", "source", "review", "ranking", "# Report")
+
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT source_json, review_json, ranking_json, markdown, created_at, updated_at "
+            "FROM report_artifacts WHERE run_id = ?",
+            ("run-1",),
+        ).fetchone()
+    assert row[:4] == ("source", "review", "ranking", "# Report")
+    assert row[4] == row[5]
+
+
+def test_save_report_artifacts_and_enqueue_delivery_rolls_back_everything_on_enqueue_failure(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_second_transactional_delivery_part "
+            "BEFORE INSERT ON delivery_parts WHEN NEW.part_index = 1 "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        store.save_report_artifacts_and_enqueue_delivery(
+            "run-1",
+            "source",
+            "review",
+            "ranking",
+            "# Report",
+            [(0, "first"), (1, "second")],
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        artifacts = connection.execute(
+            "SELECT 1 FROM report_artifacts WHERE run_id = ?", ("run-1",)
+        ).fetchall()
+    assert artifacts == []
+    assert store.pending_deliveries("run-1") == []
+
+
+def test_delivery_part_round_trip(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    digest = hashlib.sha256(b"message").hexdigest()
+    store.enqueue_delivery("run-1", 0, "message", digest)
+
+    pending = store.pending_deliveries()
+    assert isinstance(pending[0], DeliveryPart)
+    assert pending[0].body == "message"
+    assert pending[0].digest == digest
+    store.mark_delivery_delivered("run-1", 0, "42")
+
+    assert store.pending_deliveries() == []
+
+
+def test_enqueue_delivery_is_idempotent_for_same_digest_and_rejects_changed_digest(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    digest = hashlib.sha256(b"message").hexdigest()
+    store.enqueue_delivery("run-1", 0, "message", digest)
+    store.enqueue_delivery("run-1", 0, "message", digest)
+
+    with pytest.raises(ValueError, match="digest"):
+        store.enqueue_delivery("run-1", 0, "changed", "other-digest")
+
+
+def test_enqueue_delivery_rejects_digest_not_derived_from_body(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        store.enqueue_delivery("run-1", 0, "message", "digest")
+
+
+def test_delivery_attempt_and_pending_status_are_recorded_without_raw_error(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message", hashlib.sha256(b"message").hexdigest())
+
+    store.record_delivery_attempt("run-1", 0)
+    store.mark_delivery_pending("run-1", 0, "timeout: secret token")
+
+    pending = store.pending_deliveries()[0]
+    assert pending.attempts == 1
+    assert pending.state == "pending"
+    assert pending.error_category == "timeout"
+
+
+def test_delivery_claim_allows_only_one_overlapping_reporter(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+
+    first_claim = store.claim_delivery("run-1", 0)
+    second_claim = store.claim_delivery("run-1", 0)
+
+    assert first_claim is not None
+    assert first_claim.state == "in_flight"
+    assert first_claim.claim_token is not None
+    assert first_claim.attempts == 1
+    assert second_claim is None
+    assert store.pending_deliveries() == []
+
+
+def test_delivery_claim_blocks_later_part_until_all_predecessors_delivered(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery_batch("run-1", [(0, "first"), (1, "second")])
+
+    assert store.claim_delivery("run-1", 1) is None
+    first_claim = store.claim_delivery("run-1", 0)
+    assert first_claim is not None
+    assert store.claim_delivery("run-1", 1) is None
+
+    assert store.mark_delivery_delivered("run-1", 0, "42", first_claim.claim_token)
+    second_claim = store.claim_delivery("run-1", 1)
+    assert second_claim is not None
+
+
+def test_enqueue_delivery_batch_rolls_back_all_parts_on_insert_failure(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_second_delivery_part "
+            "BEFORE INSERT ON delivery_parts WHEN NEW.part_index = 1 "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
+        store.enqueue_delivery_batch("run-1", [(0, "first"), (1, "second")])
+
+    assert store.pending_deliveries("run-1") == []
+
+
+@pytest.mark.parametrize("category", ["http_429", "http_5xx", "message_entry_too_large"])
+def test_delivery_failure_categories_are_persisted_stably(tmp_path, category):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+
+    store.mark_delivery_pending("run-1", 0, category)
+
+    assert store.pending_deliveries("run-1")[0].error_category == category
+
+
+def test_stale_claim_failure_cannot_requeue_a_later_delivery(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+    first_claim = store.claim_delivery("run-1", 0)
+    assert first_claim is not None
+
+    assert store.mark_delivery_pending(
+        "run-1", 0, "timeout", first_claim.claim_token
+    )
+    second_claim = store.claim_delivery("run-1", 0)
+    assert second_claim is not None
+    assert store.mark_delivery_delivered(
+        "run-1", 0, "42", second_claim.claim_token
+    )
+
+    assert not store.mark_delivery_pending(
+        "run-1", 0, "timeout", first_claim.claim_token
+    )
+    assert store.pending_deliveries() == []
+
+
+def test_expired_delivery_claim_is_reclaimed_while_active_claim_stays_hidden(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_delivery("run-1", 0, "message")
+    claimed_at = datetime(2026, 7, 27, 12, tzinfo=UTC)
+    claim = store.claim_delivery("run-1", 0, now=claimed_at, lease_seconds=60)
+    assert claim is not None
+
+    assert store.pending_deliveries(now=claimed_at + timedelta(seconds=59)) == []
+    reclaimed = store.pending_deliveries(now=claimed_at + timedelta(seconds=61))
+
+    assert len(reclaimed) == 1
+    assert reclaimed[0].state == "pending"
+    assert reclaimed[0].claim_token is None
+    assert store.claim_delivery("run-1", 0, now=claimed_at + timedelta(seconds=61)) is not None

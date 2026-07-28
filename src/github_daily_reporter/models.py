@@ -1,10 +1,12 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 SourceName = Literal["trending", "github_search", "hacker_news"]
 RunStatus = Literal["running", "success", "partial", "failed"]
+Cohort = Literal["growth", "mature"]
+MomentumSource = Literal["exact", "snapshot_estimate", "trending_proxy", "unknown"]
 
 
 class RepoRef(BaseModel, frozen=True):
@@ -93,6 +95,25 @@ class QualityEnvelope(BaseModel):
     reviews: list[QualityReview]
 
 
+class LlmReview(BaseModel):
+    canonical_name: str
+    quality_score: int = Field(strict=True, ge=0, le=100)
+    exclude: bool = False
+    exclude_reason: str | None = None
+    summary_zh: str = Field(max_length=160)
+    highlight_zh: str = Field(max_length=240)
+
+    @model_validator(mode="after")
+    def validate_exclusion_reason(self) -> "LlmReview":
+        if self.exclude and not (self.exclude_reason or "").strip():
+            raise ValueError("exclude_reason is required when exclude is true")
+        return self
+
+
+class LlmReviewEnvelope(BaseModel):
+    reviews: list[LlmReview]
+
+
 class ScoreBreakdown(BaseModel):
     momentum: float
     evidence: float
@@ -103,10 +124,50 @@ class ScoreBreakdown(BaseModel):
     final: float
 
 
+class CohortScoreBreakdown(BaseModel):
+    cohort: Cohort
+    momentum_source: MomentumSource
+    momentum: float = Field(ge=0)
+    relative_growth: float = Field(default=0, ge=0)
+    evidence: float = Field(ge=0)
+    quality: float = Field(ge=0)
+    activity: float = Field(ge=0)
+    hacker_news: float = Field(ge=0)
+    popularity: float = Field(ge=0)
+    final: float = Field(ge=0)
+
+
 class RankedCandidate(BaseModel):
     candidate: RepositoryCandidate
-    score: ScoreBreakdown
+    score: ScoreBreakdown | CohortScoreBreakdown
     quality_degraded: bool = False
+
+
+class DailyRunResult(BaseModel):
+    run_id: str
+    status: Literal[
+        "delivered", "delivery_pending", "collection_failed", "llm_failed"
+    ]
+    growth: list[RankedCandidate] = Field(default_factory=list)
+    mature: list[RankedCandidate] = Field(default_factory=list)
+    markdown: str | None = None
+    source_health: list[SourceHealth] = Field(default_factory=list)
+    error_category: str | None = None
+
+
+class DeliveryPart(BaseModel):
+    run_id: str
+    part_index: int = Field(ge=0)
+    body: str
+    digest: str
+    attempts: int = Field(default=0, ge=0)
+    state: Literal["pending", "in_flight", "delivered"] = "pending"
+    claim_token: str | None = None
+    claim_deadline: datetime | None = None
+    telegram_message_id: str | None = None
+    error_category: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class CollectionEnvelope(BaseModel):

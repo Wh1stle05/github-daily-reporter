@@ -3,7 +3,13 @@ from math import log
 
 import pytest
 
-from github_daily_reporter.scoring import rank_candidates, score_candidate
+from github_daily_reporter.scoring import (
+    momentum_signal,
+    rank_candidates,
+    score_candidate,
+    score_growth_candidate,
+    score_mature_candidate,
+)
 
 NOW = datetime(2026, 7, 23, tzinfo=UTC)
 
@@ -100,6 +106,53 @@ def test_score_normalizes_aware_timestamps_to_utc(candidate_factory):
     score = score_candidate(candidate_factory(created_at=created_at), NOW, 0)
 
     assert score.freshness == 100
+
+
+def test_activity_uses_reactivation_push_timestamp(candidate_factory):
+    score = score_candidate(
+        candidate_factory(
+            created_at=NOW - timedelta(days=365),
+            pushed_at=NOW - timedelta(days=1),
+        ),
+        NOW,
+        0,
+    )
+    assert score.freshness == 100
+
+
+def test_momentum_signal_tracks_provenance_and_discounts_estimates(candidate_factory):
+    exact, exact_source = momentum_signal(candidate_factory(stars_24h=100))
+    estimate, estimate_source = momentum_signal(
+        candidate_factory(stars_24h=100, stars_24h_estimated=True)
+    )
+    assert exact_source == "exact"
+    assert estimate_source == "snapshot_estimate"
+    assert exact > estimate > 0
+
+
+def test_mature_quality_does_not_change_numeric_score(candidate_factory):
+    candidate = candidate_factory(stars_total=10_000, stars_24h=100)
+    low = score_mature_candidate(candidate, NOW, quality_score=0)
+    high = score_mature_candidate(candidate, NOW, quality_score=100)
+    assert low.final == high.final
+
+
+def test_mature_score_contains_relative_growth_component(candidate_factory):
+    score = score_mature_candidate(
+        candidate_factory(stars_total=10_000, stars_24h=100, growth_rate_24h=0.25),
+        NOW,
+        quality_score=100,
+    )
+    assert score.relative_growth == 25
+
+
+def test_mature_momentum_component_is_absolute_only(candidate_factory):
+    score = score_mature_candidate(
+        candidate_factory(stars_total=10_000, stars_24h=100, growth_rate_24h=1),
+        NOW,
+        quality_score=0,
+    )
+    assert score.momentum == round(100 * log(101) / log(1001), 6)
 
 
 @pytest.mark.parametrize("field", ["created_at", "now"])

@@ -19,9 +19,12 @@ import yaml
 from pydantic import ValidationError
 
 from github_daily_reporter.config import ReporterConfig, load_config
+from github_daily_reporter.daily import DailyReporter
 from github_daily_reporter.github_client import GitHubClient
+from github_daily_reporter.llm import LlmReviewClient
 from github_daily_reporter.models import (
     CollectionEnvelope,
+    DailyRunResult,
     QualityEnvelope,
     QualityReview,
     RepositoryCandidate,
@@ -30,6 +33,7 @@ from github_daily_reporter.pipeline import CollectionPipeline, serialize_collect
 from github_daily_reporter.quality import deterministic_exclusion
 from github_daily_reporter.scoring import rank_candidates
 from github_daily_reporter.state import StateStore
+from github_daily_reporter.telegram import TelegramClient
 
 
 class OperatorError(ValueError):
@@ -47,6 +51,9 @@ def _parser() -> argparse.ArgumentParser:
 
     collect = subparsers.add_parser("collect")
     collect.add_argument("--config", type=Path, required=True)
+
+    daily = subparsers.add_parser("daily")
+    daily.add_argument("--config", type=Path, required=True)
 
     rank = subparsers.add_parser("rank")
     rank.add_argument("--config", type=Path, required=True)
@@ -74,6 +81,26 @@ async def run_collection(config_path: Path) -> CollectionEnvelope:
         return await pipeline.collect()
 
 
+async def run_daily(config_path: Path) -> DailyRunResult:
+    """Build the owned transports and run one self-contained daily report."""
+    config = load_config(config_path)
+    store = StateStore(config.state_db)
+    timeout = httpx.Timeout(config.request_timeout_seconds)
+    headers = {"User-Agent": "github-daily-reporter/0.1"}
+    async with GitHubClient(
+        config.github_token.get_secret_value(), timeout=config.request_timeout_seconds
+    ) as github, httpx.AsyncClient(timeout=timeout, headers=headers) as web:
+        collector = CollectionPipeline(config, store, github, web)
+        reporter = DailyReporter(
+            config=config,
+            collector=collector,
+            llm=LlmReviewClient(config),
+            telegram=TelegramClient(config),
+            store=store,
+        )
+        return await reporter.run()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the requested command and return a shell-compatible status code."""
     try:
@@ -81,6 +108,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "collect":
             envelope = asyncio.run(run_collection(args.config))
             print(serialize_collection_envelope(envelope))
+            return 0
+        if args.command == "daily":
+            result = asyncio.run(run_daily(args.config))
+            operational = {
+                "run_id": result.run_id,
+                "status": result.status,
+                "growth_count": len(result.growth),
+                "mature_count": len(result.mature),
+            }
+            if result.error_category is not None:
+                operational["error_category"] = result.error_category
+            print(json.dumps(operational, sort_keys=True))
             return 0
         if args.command == "rank":
             _rank(args.config, args.run_id, args.quality_file)
@@ -115,7 +154,18 @@ def _doctor(config_path: Path) -> int:
 
     checks["config_valid"] = True
     checks["github_token_present"] = bool(config.github_token.get_secret_value().strip())
-    checks["database_writable"] = _probe_database(config.state_db)
+    checks["llm_api_key_present"] = bool(config.llm_api_key.get_secret_value().strip())
+    checks["telegram_bot_token_present"] = bool(
+        config.telegram_bot_token.get_secret_value().strip()
+    )
+    checks["telegram_chat_id_present"] = bool(config.telegram_chat_id.strip())
+    checks["telegram_thread_id_valid"] = (
+        config.telegram_message_thread_id is None
+        or config.telegram_message_thread_id > 0
+    )
+    database_access = _probe_database(config.state_db)
+    checks["database_writable"] = database_access
+    checks["delivery_database_access"] = database_access
 
     github = probe_github(config)
     result["github"] = github
@@ -132,7 +182,8 @@ def _doctor(config_path: Path) -> int:
     result["assets"] = assets
     checks["wrapper_source"] = assets["wrapper_source"]
     checks["wrapper_executable"] = assets["wrapper_executable"]
-    checks["skill_source"] = assets["skill_source"]
+    checks["legacy_wrapper_absent"] = assets["legacy_wrapper_absent"]
+    checks["skill_source_absent"] = assets["skill_source_absent"]
 
     result["ok"] = all(checks.values())
     print(json.dumps(result, sort_keys=True))
@@ -145,6 +196,8 @@ def _probe_database(path: Path) -> bool:
         StateStore(path)
         with sqlite3.connect(path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute("SELECT 1 FROM report_artifacts LIMIT 1")
+            connection.execute("SELECT 1 FROM delivery_parts LIMIT 1")
             connection.execute("CREATE TABLE __doctor_write_probe (id INTEGER)")
             connection.rollback()
         return True
@@ -208,12 +261,14 @@ def probe_hermes() -> dict[str, Any]:
 
 def _probe_assets() -> dict[str, bool]:
     project_root = Path(__file__).resolve().parents[2]
-    wrapper = project_root / "deploy" / "hermes" / "github-daily-collect.sh"
+    wrapper = project_root / "deploy" / "hermes" / "github-daily-run.sh"
+    legacy_wrapper = project_root / "deploy" / "hermes" / "github-daily-collect.sh"
     skill = project_root / "deploy" / "hermes" / "skills" / "github-daily-editor" / "SKILL.md"
     return {
         "wrapper_source": wrapper.is_file(),
         "wrapper_executable": wrapper.is_file() and os.access(wrapper, os.X_OK),
-        "skill_source": skill.is_file(),
+        "legacy_wrapper_absent": not legacy_wrapper.exists(),
+        "skill_source_absent": not skill.exists(),
     }
 
 
