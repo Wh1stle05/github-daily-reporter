@@ -21,8 +21,7 @@ verify uncertain details when useful, and write the two report files.
    promotional pages, resource/Awesome lists, learning roadmaps, interview
    question collections, course notes, and tutorial indexes without an
    independent implementation.
-4. Quality is the priority. Long-term memory or stack affinity is only a weak
-   tie-breaker; do not filter strongly by technology.
+4. Quality is the absolute priority. When quality is comparable, prefer projects whose technology stack aligns with my known profile (AI/ML tooling, K8s/cloud-native, LLM serving, Python/Go infrastructure, developer tools, MLOps). Your memory of me is the reference for this — use it as a positive signal, not a hard filter. A mediocre project in my stack should never beat a high-quality project outside it.
 5. If the README excerpt is incomplete or contradicts the metadata, read the
    matching `evidence/` file or use `web_fetch` to verify. A fetch failure is
    non-blocking: label the uncertainty or omit it, and do not repeatedly retry
