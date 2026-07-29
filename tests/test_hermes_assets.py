@@ -6,12 +6,14 @@ ROOT = Path(__file__).parents[1]
 
 
 def test_no_agent_wrapper_uses_hybrid_command():
-    wrapper = ROOT / "deploy/hermes/github-daily-run.sh"
+    wrapper = ROOT / "deploy/scripts/github-daily-runner.sh"
     text = wrapper.read_text(encoding="utf-8")
     assert "cli hybrid --config" in text
     assert "cli daily" not in text
     assert "reporter.py" not in text
     assert " cli rank " not in text
+    assert "export TELEGRAM_BOT_TOKEN" not in text
+    assert "export TELEGRAM_CHAT_ID" not in text
     assert wrapper.stat().st_mode & stat.S_IXUSR
 
 

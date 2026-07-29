@@ -13,7 +13,7 @@
 
 ```text
 Hermes Cron --no-agent
-  -> deploy/hermes/github-daily-run.sh
+  -> deploy/scripts/github-daily-runner.sh
   -> cli hybrid
   -> Trending + GitHub Search + Hacker News + GitHub metadata
   -> SQLite snapshot + cohort scoring
@@ -46,10 +46,10 @@ cp .env.example .env
 部署 wrapper 并创建 Cron：
 
 ```bash
-install -m 700 deploy/hermes/github-daily-run.sh "$HOME/.hermes/scripts/github-daily-run.sh"
+install -m 700 deploy/scripts/github-daily-runner.sh "$HOME/.hermes/scripts/github-daily-runner.sh"
 hermes cron create '0 9 * * *' '' \
   --name github-daily-reporter \
-  --script github-daily-run.sh \
+  --script github-daily-runner.sh \
   --no-agent \
   --workdir "$HOME/workspace/github-daily-reporter"
 ```
@@ -91,7 +91,7 @@ data/runs/github-daily-report-YYYY-MM-DD/
 
 ## 旧入口
 
-`daily`、`reporter.py` 和 `quality-review/rank` 是历史兼容代码，不属于生产 Cron。生产入口只有 `cli hybrid` 和 `deploy/hermes/github-daily-run.sh`。
+生产入口只有 `cli hybrid` 和 `deploy/scripts/github-daily-runner.sh`。
 
 ## 验证
 

@@ -67,6 +67,20 @@ def test_daily_command_is_retired_in_favor_of_hybrid(capsys, config_path):
     assert "legacy daily command retired" in capsys.readouterr().err
 
 
+def test_probe_assets_detects_a_restored_legacy_wrapper(monkeypatch, tmp_path):
+    source = tmp_path / "src" / "github_daily_reporter" / "cli.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli, "__file__", str(source))
+
+    assert cli._probe_assets()["legacy_wrapper_absent"] is True
+
+    legacy = tmp_path / "deploy" / "hermes" / "github-daily-run.sh"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    assert cli._probe_assets()["legacy_wrapper_absent"] is False
+
+
 @pytest.mark.asyncio
 async def test_run_daily_wires_owned_clients(monkeypatch, tmp_path):
     config = SimpleNamespace(

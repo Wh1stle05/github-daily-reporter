@@ -267,8 +267,8 @@ def probe_hermes() -> dict[str, Any]:
 
 def _probe_assets() -> dict[str, bool]:
     project_root = Path(__file__).resolve().parents[2]
-    wrapper = project_root / "deploy" / "hermes" / "github-daily-run.sh"
-    legacy_wrapper = project_root / "deploy" / "hermes" / "github-daily-collect.sh"
+    wrapper = project_root / "deploy" / "scripts" / "github-daily-runner.sh"
+    legacy_wrapper = project_root / "deploy" / "hermes" / "github-daily-run.sh"
     skill = project_root / "skills" / "github-daily-reporter" / "SKILL.md"
     return {
         "wrapper_source": wrapper.is_file(),

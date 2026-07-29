@@ -26,12 +26,17 @@ async def test_hermes_starts_a_new_session_and_returns_output(monkeypatch, tmp_p
     captured = {}
 
     async def fake_exec(*args, **kwargs):
+        captured["args"] = args
         captured.update(kwargs)
         return process
 
     monkeypatch.setattr("github_daily_reporter.agent_runner.asyncio.create_subprocess_exec", fake_exec)
     result = await run_hermes_editorial(tmp_path, "attempt-1", timeout_seconds=1)
     assert captured["start_new_session"] is True
+    prompt = captured["args"][2]
+    assert "# GitHub 成长项目榜 · YYYY-MM-DD" in prompt
+    assert "# GitHub 万星增量榜 · YYYY-MM-DD" in prompt
+    assert "Preserve every Python `python_score` exactly" in prompt
     assert result.returncode == 0
     assert result.stdout == "done"
 

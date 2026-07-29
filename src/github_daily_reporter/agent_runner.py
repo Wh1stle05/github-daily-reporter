@@ -13,6 +13,7 @@ from github_daily_reporter.editorial import prepare_attempt
 
 
 TERMINATION_GRACE_SECONDS = 5.0
+SKILL_SOURCE = Path(__file__).resolve().parents[2] / "skills" / "github-daily-reporter" / "SKILL.md"
 
 
 @dataclass(frozen=True)
@@ -82,8 +83,14 @@ async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
 
 
 def _prompt(run_dir: Path, attempt_dir: Path) -> str:
+    skill = SKILL_SOURCE.read_text(encoding="utf-8")
     return (
-        "Use the github-daily-reporter skill. Read the editorial handoff at "
+        "Follow the complete authoritative github-daily-reporter skill included below. "
+        "Do not load or use the legacy github-daily-editor skill.\n\n"
+        "<github-daily-reporter-skill>\n"
+        f"{skill.rstrip()}\n"
+        "</github-daily-reporter-skill>\n\n"
+        "Read the editorial handoff at "
         f"{run_dir / 'editorial-input.json'}. Write only "
         f"{attempt_dir / 'growth-report.md'} and {attempt_dir / 'mature-report.md'}; "
         "then stop. Do not send Telegram messages or run collection/rank scripts."
