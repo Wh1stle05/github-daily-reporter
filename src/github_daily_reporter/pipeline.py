@@ -17,6 +17,7 @@ from github_daily_reporter.collectors.hacker_news import collect_hacker_news
 from github_daily_reporter.collectors.star_velocity import enrich_velocity
 from github_daily_reporter.collectors.trending import collect_trending
 from github_daily_reporter.config import ReporterConfig
+from github_daily_reporter.editorial import build_editorial_input, write_editorial_artifacts
 from github_daily_reporter.github_client import GitHubClient
 from github_daily_reporter.models import (
     CollectionEnvelope,
@@ -114,6 +115,12 @@ class CollectionPipeline:
                 [item.candidate for item in ranked[: self.config.max_llm_candidates]]
             )
             self._write_candidates(run_id, bounded)
+
+            # The UUID-backed legacy artifact remains for compatibility; the
+            # active hybrid handoff is date-addressable and contains both pools.
+            date_run_dir = self._date_run_dir(now)
+            editorial = build_editorial_input(eligible, source_health, date_run_dir, now=now)
+            write_editorial_artifacts(editorial, date_run_dir)
 
             status = "partial" if any(item.status != "success" for item in source_health) else "success"
             self.store.finish_run(run_id, status, source_health)
@@ -297,6 +304,10 @@ class CollectionPipeline:
     def _run_dir(self, run_id: str) -> Path:
         project_root = self.config.project_root or self.config.state_db.parent.parent
         return project_root / "data" / "runs" / run_id
+
+    def _date_run_dir(self, now: datetime) -> Path:
+        project_root = self.config.project_root or self.config.state_db.parent.parent
+        return project_root / "data" / "runs" / f"github-daily-report-{now.date().isoformat()}"
 
     @staticmethod
     def _quality_review_path(run_id: str) -> str:
