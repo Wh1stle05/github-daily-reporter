@@ -5,6 +5,7 @@ import pytest
 
 from github_daily_reporter.scoring import (
     momentum_signal,
+    normalize_elapsed_velocity,
     rank_candidates,
     score_candidate,
     score_growth_candidate,
@@ -143,7 +144,7 @@ def test_mature_score_contains_relative_growth_component(candidate_factory):
         NOW,
         quality_score=100,
     )
-    assert score.relative_growth == 25
+    assert score.relative_growth == 100
 
 
 def test_mature_momentum_component_is_absolute_only(candidate_factory):
@@ -205,3 +206,43 @@ def test_equal_final_scores_use_all_stable_tie_breakers(candidate_factory):
 
     assert [item.candidate.canonical_name for item in ranked] == ["z/repo", "a/repo"]
     assert ranked[0].quality_degraded is True
+
+
+def test_growth_uses_versioned_six_component_weights(monkeypatch, candidate_factory):
+    import github_daily_reporter.scoring as scoring
+
+    monkeypatch.setattr(scoring, "_absolute_momentum_signal", lambda candidate: (80.0, "exact"))
+    monkeypatch.setattr(scoring, "_relative_growth", lambda candidate, cohort="growth": 70.0)
+    monkeypatch.setattr(scoring, "_evidence_v1", lambda candidate: 60.0)
+    monkeypatch.setattr(scoring, "_freshness", lambda now, created_at: 90.0)
+    monkeypatch.setattr(scoring, "_hacker_news", lambda candidate: 40.0)
+    monkeypatch.setattr(scoring, "_popularity", lambda candidate: 20.0)
+
+    score = score_growth_candidate(candidate_factory(), NOW)
+
+    assert score.scoring_version == "agent-hybrid-v1"
+    assert score.final == 70.5
+
+
+def test_mature_relative_ratio_point_one_is_full_scale(candidate_factory):
+    score = score_mature_candidate(candidate_factory(growth_rate_24h=0.01), NOW)
+    assert score.relative_growth == 100.0
+
+
+def test_new_scores_round_only_final_to_one_decimal(candidate_factory):
+    score = score_growth_candidate(candidate_factory(stars_24h=17, growth_rate_24h=0.013), NOW)
+    assert score.final == round(score.final, 1)
+
+
+@pytest.mark.parametrize(
+    ("delta", "elapsed_hours", "expected"),
+    [(12, 12, 24.0), (36, 36, 24.0), (12, 36, 8.0)],
+)
+def test_normalize_elapsed_velocity_uses_observed_window(delta, elapsed_hours, expected):
+    assert normalize_elapsed_velocity(delta, elapsed_hours) == expected
+
+
+@pytest.mark.parametrize("elapsed_hours", [0, -1, 49, 100])
+def test_normalize_elapsed_velocity_rejects_invalid_windows(elapsed_hours):
+    with pytest.raises(ValueError):
+        normalize_elapsed_velocity(1, elapsed_hours)

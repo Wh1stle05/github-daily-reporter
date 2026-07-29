@@ -7,6 +7,7 @@ SourceName = Literal["trending", "github_search", "hacker_news"]
 RunStatus = Literal["running", "success", "partial", "failed"]
 Cohort = Literal["growth", "mature"]
 MomentumSource = Literal["exact", "snapshot_estimate", "trending_proxy", "unknown"]
+SCORING_VERSION = "agent-hybrid-v1"
 
 
 class RepoRef(BaseModel, frozen=True):
@@ -56,12 +57,17 @@ class RepositoryCandidate(BaseModel):
     has_independent_fork_activity: bool = False
     license_spdx: str | None = None
     primary_language: str | None = None
+    topics: list[str] = Field(default_factory=list)
     stars_total: int = Field(default=0, ge=0)
     forks_total: int = Field(default=0, ge=0)
     open_issues_count: int = Field(default=0, ge=0)
     stars_24h: int | None = Field(default=None, ge=0)
+    velocity_rate_24h: float | None = Field(default=None, ge=0)
     stars_24h_estimated: bool = False
     growth_rate_24h: float | None = Field(default=None, ge=0)
+    velocity_observed_at: datetime | None = None
+    velocity_elapsed_hours: float | None = Field(default=None, ge=0)
+    velocity_source: MomentumSource = "unknown"
     velocity_hit: bool = False
     trending_rank: int | None = Field(default=None, ge=1)
     trending_stars_today: int | None = Field(default=None, ge=0)
@@ -125,6 +131,7 @@ class ScoreBreakdown(BaseModel):
 
 
 class CohortScoreBreakdown(BaseModel):
+    scoring_version: str = SCORING_VERSION
     cohort: Cohort
     momentum_source: MomentumSource
     momentum: float = Field(ge=0)
@@ -135,6 +142,47 @@ class CohortScoreBreakdown(BaseModel):
     hacker_news: float = Field(ge=0)
     popularity: float = Field(ge=0)
     final: float = Field(ge=0)
+
+
+class EditorialCandidate(BaseModel):
+    """Compact, immutable Python facts handed to the editorial Agent."""
+
+    canonical_name: str
+    full_name: str
+    html_url: str
+    cohort: Cohort
+    python_rank: int = Field(ge=1)
+    python_score: float = Field(ge=0, le=100)
+    score_breakdown: CohortScoreBreakdown
+    stars_total: int = Field(ge=0)
+    stars_24h: float | None = Field(default=None, ge=0)
+    growth_rate_24h: float | None = Field(default=None, ge=0)
+    velocity_source: MomentumSource = "unknown"
+    stars_24h_estimated: bool = False
+    primary_language: str | None = None
+    topics: list[str] = Field(default_factory=list)
+    description: str | None = None
+    readme_excerpt: str = ""
+    created_at: datetime
+    pushed_at: datetime | None = None
+    discovery_sources: list[SourceName] = Field(default_factory=list)
+    source_errors: list[str] = Field(default_factory=list)
+    risk_markers: list[str] = Field(default_factory=list)
+
+
+class EditorialCohort(BaseModel):
+    primary: list[EditorialCandidate] = Field(default_factory=list)
+    reserve: list[EditorialCandidate] = Field(default_factory=list)
+
+
+class EditorialInput(BaseModel):
+    schema_version: str = SCORING_VERSION
+    run_id: str
+    generated_at: datetime
+    status: Literal["success", "partial"]
+    source_health: list[SourceHealth] = Field(default_factory=list)
+    available_counts: dict[Cohort, int] = Field(default_factory=dict)
+    cohorts: dict[Cohort, EditorialCohort]
 
 
 class RankedCandidate(BaseModel):
@@ -177,5 +225,5 @@ class CollectionEnvelope(BaseModel):
     generated_at: datetime
     source_health: list[SourceHealth]
     candidates: list[RepositoryCandidate]
-    quality_review_path: str
+    quality_review_path: str | None = None
     fatal_error: str | None = None

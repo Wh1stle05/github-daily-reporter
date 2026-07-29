@@ -118,6 +118,22 @@ def test_count_recent_stars_rejects_edges_out_of_descending_order():
         )
 
 
+def test_normalize_snapshot_window_rejects_future_or_negative_observations():
+    from github_daily_reporter.collectors.star_velocity import normalize_snapshot_window
+
+    with pytest.raises(ValueError, match="future"):
+        normalize_snapshot_window(100, 110, NOW, NOW + timedelta(hours=1))
+    with pytest.raises(ValueError, match="negative"):
+        normalize_snapshot_window(100, 110, NOW, NOW - timedelta(hours=24))
+
+
+def test_normalize_snapshot_window_rejects_snapshot_older_than_48_hours():
+    from github_daily_reporter.collectors.star_velocity import normalize_snapshot_window
+
+    with pytest.raises(ValueError, match="48"):
+        normalize_snapshot_window(100, 110, NOW, NOW - timedelta(hours=49))
+
+
 @pytest.mark.asyncio
 async def test_velocity_hit_is_strictly_greater_than_threshold(
     candidate: RepositoryCandidate, fake_graphql: FakeGraphQL
@@ -387,7 +403,7 @@ async def test_enrich_velocity_uses_snapshot_gain_when_graphql_fails(
 
     assert enriched.stars_24h == 60
     assert enriched.stars_24h_estimated is True
-    assert enriched.growth_rate_24h == pytest.approx(60 / 40)
+    assert enriched.growth_rate_24h == pytest.approx((60 * 24 / 25) / 40)
     assert enriched.velocity_hit is True
     assert snapshot_estimator.calls == [
         (candidate.canonical_name, candidate.stars_total, NOW - timedelta(hours=24), NOW)

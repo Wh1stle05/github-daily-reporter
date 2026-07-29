@@ -109,7 +109,7 @@ def test_estimate_stars_24h_uses_closest_snapshot_in_window(tmp_path):
 
     assert store.estimate_stars_24h(
         "owner/repo", 100, now - timedelta(days=2), now
-    ) == (30, expected_at)
+    ) == (40, now - timedelta(hours=29))
 
 
 def test_estimate_stars_24h_keeps_24h_snapshot_when_cutoff_is_22h(tmp_path):

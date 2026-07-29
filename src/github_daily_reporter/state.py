@@ -236,12 +236,16 @@ class StateStore:
             "candidate_json = excluded.candidate_json, last_seen_at = excluded.last_seen_at",
             (candidate.canonical_name, candidate.model_dump_json(), timestamp),
         )
+        existing = connection.execute(
+            "SELECT 1 FROM repo_snapshots WHERE canonical_name = ? AND observed_at = ?",
+            (candidate.canonical_name, timestamp),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError("duplicate snapshot timestamp")
         connection.execute(
             "INSERT INTO repo_snapshots "
             "(canonical_name, observed_at, stars_total, forks_total, open_issues_count) "
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(canonical_name, observed_at) DO UPDATE SET "
-            "stars_total = excluded.stars_total, forks_total = excluded.forks_total, "
-            "open_issues_count = excluded.open_issues_count",
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 candidate.canonical_name,
                 timestamp,
@@ -300,8 +304,10 @@ class StateStore:
         cutoff: datetime,
         now: datetime,
     ) -> tuple[int, datetime] | None:
-        earliest = now - timedelta(hours=28)
-        latest = now - timedelta(hours=20)
+        now_utc = _require_aware(now)
+        target = _require_aware(cutoff)
+        earliest = now_utc - timedelta(hours=48)
+        latest = now_utc
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT stars_total, observed_at FROM repo_snapshots "
@@ -311,10 +317,12 @@ class StateStore:
         if not rows:
             return None
         stars_total, observed_at = min(
-            rows,
-            key=lambda row: abs((_parse_timestamp(row[1]) - cutoff).total_seconds()),
+            rows, key=lambda row: abs((_parse_timestamp(row[1]) - target).total_seconds())
         )
-        return max(current_stars - stars_total, 0), _parse_timestamp(observed_at)
+        observed = _parse_timestamp(observed_at)
+        if observed >= now_utc or current_stars < stars_total:
+            return None
+        return current_stars - stars_total, observed
 
     def save_ranking(
         self,
@@ -668,7 +676,13 @@ class StateStore:
 
 
 def _timestamp(value: datetime) -> str:
-    return value.astimezone(UTC).isoformat()
+    return _require_aware(value).astimezone(UTC).isoformat()
+
+
+def _require_aware(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _parse_timestamp(value: str) -> datetime:

@@ -6,6 +6,7 @@ from typing import Any
 
 from github_daily_reporter.github_client import GitHubClient
 from github_daily_reporter.models import RepositoryCandidate
+from github_daily_reporter.scoring import normalize_elapsed_velocity
 
 
 REPO_STARS_QUERY = """query RepoStars($owner: String!, $name: String!, $cursor: String) {
@@ -78,11 +79,39 @@ async def enrich_velocity(
             _clear_velocity(candidate)
             _record_velocity_error(candidate)
             return candidate
-        _set_velocity(candidate, estimate, threshold, estimated=True)
+        try:
+            raw_gain, observed_at = estimate
+            gain, rate, elapsed_hours = normalize_snapshot_window(
+                candidate.stars_total,
+                candidate.stars_total - raw_gain,
+                now_utc,
+                observed_at,
+            )
+        except (TypeError, ValueError):
+            _clear_velocity(candidate)
+            _record_velocity_error(candidate)
+            return candidate
+        _set_velocity(
+            candidate,
+            gain,
+            threshold,
+            estimated=True,
+            rate_24h=rate,
+            elapsed_hours=elapsed_hours,
+            observed_at=observed_at,
+        )
         _clear_velocity_error(candidate)
         return candidate
 
-    _set_velocity(candidate, count, threshold, estimated=False)
+    _set_velocity(
+        candidate,
+        count,
+        threshold,
+        estimated=False,
+        rate_24h=normalize_elapsed_velocity(count, window_hours),
+        elapsed_hours=float(window_hours),
+        observed_at=now_utc,
+    )
     _clear_velocity_error(candidate)
     return candidate
 
@@ -185,7 +214,7 @@ def _snapshot_estimate(
     cutoff: datetime,
     now: datetime,
     estimator: SnapshotEstimator | None,
-) -> int | None:
+) -> tuple[int, datetime] | None:
     if estimator is None:
         return None
     try:
@@ -201,22 +230,68 @@ def _snapshot_estimate(
         _normalize_utc(observed_at)
     except (TypeError, ValueError):
         return None
-    return gain
+    return gain, _normalize_utc(observed_at)
+
+
+def normalize_snapshot_window(
+    current_stars: int,
+    previous_stars: int,
+    now: datetime,
+    previous_observed_at: datetime,
+) -> tuple[int, float, float]:
+    """Validate a local snapshot pair and return raw delta, daily rate, hours."""
+    now_utc = _normalize_utc(now)
+    previous_at = _normalize_utc(previous_observed_at)
+    if previous_at > now_utc:
+        raise ValueError("snapshot is in the future")
+    elapsed_hours = (now_utc - previous_at).total_seconds() / 3600
+    if elapsed_hours <= 0:
+        raise ValueError("snapshot timestamp is duplicate")
+    if elapsed_hours > 48:
+        raise ValueError("snapshot is older than 48 hours")
+    if (
+        isinstance(current_stars, bool)
+        or isinstance(previous_stars, bool)
+        or current_stars < 0
+        or previous_stars < 0
+    ):
+        raise ValueError("snapshot stars must be non-negative")
+    delta = current_stars - previous_stars
+    if delta < 0:
+        raise ValueError("snapshot delta is negative")
+    return delta, normalize_elapsed_velocity(delta, elapsed_hours), elapsed_hours
 
 
 def _set_velocity(
-    candidate: RepositoryCandidate, count: int, threshold: int, *, estimated: bool
+    candidate: RepositoryCandidate,
+    count: int,
+    threshold: int,
+    *,
+    estimated: bool,
+    rate_24h: float | None = None,
+    elapsed_hours: float | None = None,
+    observed_at: datetime | None = None,
 ) -> None:
     candidate.stars_24h = count
+    candidate.velocity_rate_24h = float(count if rate_24h is None else rate_24h)
     candidate.stars_24h_estimated = estimated
-    candidate.growth_rate_24h = count / max(candidate.stars_total - count, 30)
+    candidate.growth_rate_24h = candidate.velocity_rate_24h / max(
+        candidate.stars_total - count, 30
+    )
+    candidate.velocity_observed_at = observed_at
+    candidate.velocity_elapsed_hours = elapsed_hours
+    candidate.velocity_source = "snapshot_estimate" if estimated else "exact"
     candidate.velocity_hit = count > threshold
 
 
 def _clear_velocity(candidate: RepositoryCandidate) -> None:
     candidate.stars_24h = None
+    candidate.velocity_rate_24h = None
     candidate.stars_24h_estimated = False
     candidate.growth_rate_24h = None
+    candidate.velocity_observed_at = None
+    candidate.velocity_elapsed_hours = None
+    candidate.velocity_source = "unknown"
     candidate.velocity_hit = False
 
 
