@@ -92,6 +92,16 @@ CREATE TABLE IF NOT EXISTS report_artifacts (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS error_notifications (
+  run_id TEXT PRIMARY KEY,
+  body TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','delivered')),
+  telegram_message_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """ + DELIVERY_PARTS_SCHEMA
 
 
@@ -480,6 +490,64 @@ class StateStore:
         with self._connection() as connection:
             self._enqueue_delivery_parts(connection, run_id, prepared, timestamp)
 
+    def enqueue_error_notification(self, run_id: str, body: str) -> None:
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        timestamp = _timestamp(datetime.now(UTC))
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT digest FROM error_notifications WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != digest:
+                    raise ValueError("error notification digest does not match existing run")
+                return
+            connection.execute(
+                "INSERT INTO error_notifications "
+                "(run_id, body, digest, attempts, state, telegram_message_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, 'pending', NULL, ?, ?)",
+                (run_id, body, digest, timestamp, timestamp),
+            )
+
+    def pending_error_notifications(self) -> list[dict[str, object]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT run_id, body, digest, attempts, state, telegram_message_id "
+                "FROM error_notifications WHERE state = 'pending' ORDER BY run_id"
+            ).fetchall()
+        return [
+            {
+                "run_id": row[0],
+                "body": row[1],
+                "digest": row[2],
+                "attempts": row[3],
+                "state": row[4],
+                "telegram_message_id": row[5],
+            }
+            for row in rows
+        ]
+
+    def mark_error_notification_delivered(self, run_id: str, telegram_message_id: str) -> None:
+        timestamp = _timestamp(datetime.now(UTC))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE error_notifications SET state = 'delivered', telegram_message_id = ?, "
+                "updated_at = ? WHERE run_id = ?",
+                (telegram_message_id, timestamp, run_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(run_id)
+
+    def record_error_notification_attempt(self, run_id: str) -> None:
+        timestamp = _timestamp(datetime.now(UTC))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE error_notifications SET attempts = attempts + 1, updated_at = ? "
+                "WHERE run_id = ? AND state = 'pending'",
+                (timestamp, run_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(run_id)
+
     @staticmethod
     def _prepare_delivery_parts(parts: Iterable[tuple[int, str]]) -> list[tuple[int, str, str]]:
         """Validate and hash delivery parts before beginning a write transaction."""
@@ -538,6 +606,18 @@ class StateStore:
             self._reclaim_expired_deliveries(connection, timestamp)
             rows = connection.execute(query, parameters).fetchall()
         return [self._delivery_part(row) for row in rows]
+
+    def get_delivery_part(self, run_id: str, part_index: int) -> DeliveryPart:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT run_id, part_index, body, digest, attempts, state, "
+                "claim_token, claim_deadline, telegram_message_id, error_category, created_at, updated_at "
+                "FROM delivery_parts WHERE run_id = ? AND part_index = ?",
+                (run_id, part_index),
+            ).fetchone()
+        if row is None:
+            raise KeyError((run_id, part_index))
+        return self._delivery_part(row)
 
     def claim_delivery(
         self,

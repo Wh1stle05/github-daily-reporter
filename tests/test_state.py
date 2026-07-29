@@ -406,3 +406,12 @@ def test_expired_delivery_claim_is_reclaimed_while_active_claim_stays_hidden(tmp
     assert reclaimed[0].state == "pending"
     assert reclaimed[0].claim_token is None
     assert store.claim_delivery("run-1", 0, now=claimed_at + timedelta(seconds=61)) is not None
+
+
+def test_error_notifications_have_independent_pending_state(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.enqueue_error_notification("run-1", "collection failed")
+    pending = store.pending_error_notifications()
+    assert [item["run_id"] for item in pending] == ["run-1"]
+    store.mark_error_notification_delivered("run-1", "99")
+    assert store.pending_error_notifications() == []
