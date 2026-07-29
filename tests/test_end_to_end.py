@@ -1,4 +1,5 @@
 import pytest
+import json
 
 
 @pytest.mark.asyncio
@@ -47,3 +48,18 @@ async def test_sequential_collection_replaces_recorded_routes(e2e_harness, monke
     assert failed.fatal_error == "all discovery sources failed"
     assert len(e2e_harness.respx_mock.routes) == routes_after_partial
     assert clear_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_collection_publishes_date_handoff_and_immutable_score_facts(e2e_harness):
+    result = await e2e_harness.collect()
+    run_dir = e2e_harness.root / "data" / "runs" / "github-daily-report-2026-07-24"
+    handoff = json.loads((run_dir / "editorial-input.json").read_text(encoding="utf-8"))
+    assert handoff["schema_version"] == "agent-hybrid-v1"
+    assert handoff["cohorts"]["growth"]["primary"]
+    item = handoff["cohorts"]["growth"]["primary"][0]
+    assert item["python_score"] == item["score_breakdown"]["final"]
+    assert item["score_breakdown"]["scoring_version"] == "agent-hybrid-v1"
+    assert (run_dir / "collection.json").is_file()
+    assert (run_dir / "run-status.json").is_file()
+    assert result.candidates[0].canonical_name == "acme/tool"
