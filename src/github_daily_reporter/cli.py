@@ -114,17 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             print(serialize_collection_envelope(envelope))
             return 0
         if args.command == "daily":
-            result = asyncio.run(run_daily(args.config))
-            operational = {
-                "run_id": result.run_id,
-                "status": result.status,
-                "growth_count": len(result.growth),
-                "mature_count": len(result.mature),
-            }
-            if result.error_category is not None:
-                operational["error_category"] = result.error_category
-            print(json.dumps(operational, sort_keys=True))
-            return 0
+            raise OperatorError("legacy daily command retired; use hybrid")
         if args.command == "hybrid":
             result = asyncio.run(run_hybrid_pipeline(args.config))
             operational = {
@@ -199,7 +189,7 @@ def _doctor(config_path: Path) -> int:
     checks["wrapper_source"] = assets["wrapper_source"]
     checks["wrapper_executable"] = assets["wrapper_executable"]
     checks["legacy_wrapper_absent"] = assets["legacy_wrapper_absent"]
-    checks["skill_source_absent"] = assets["skill_source_absent"]
+    checks["skill_source"] = assets["skill_source"]
 
     result["ok"] = all(checks.values())
     print(json.dumps(result, sort_keys=True))
@@ -279,11 +269,12 @@ def _probe_assets() -> dict[str, bool]:
     project_root = Path(__file__).resolve().parents[2]
     wrapper = project_root / "deploy" / "hermes" / "github-daily-run.sh"
     legacy_wrapper = project_root / "deploy" / "hermes" / "github-daily-collect.sh"
-    skill = project_root / "deploy" / "hermes" / "skills" / "github-daily-editor" / "SKILL.md"
+    skill = project_root / "skills" / "github-daily-reporter" / "SKILL.md"
     return {
         "wrapper_source": wrapper.is_file(),
         "wrapper_executable": wrapper.is_file() and os.access(wrapper, os.X_OK),
         "legacy_wrapper_absent": not legacy_wrapper.exists(),
+        "skill_source": skill.is_file(),
         "skill_source_absent": not skill.exists(),
     }
 

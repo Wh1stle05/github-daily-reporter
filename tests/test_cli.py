@@ -62,34 +62,9 @@ def test_collect_prints_exactly_one_json_document(monkeypatch, capsys, config_pa
     assert json.loads(capsys.readouterr().out)["schema_version"] == "1"
 
 
-def test_daily_prints_one_operational_json_without_report(
-    monkeypatch, capsys, config_path
-):
-    async def fake_daily(_config_path):
-        return SimpleNamespace(
-            run_id="daily-run",
-            status="delivered",
-            growth=[object()],
-            mature=[],
-            markdown="# report body",
-            error_category=None,
-        )
-
-    monkeypatch.setattr("github_daily_reporter.cli.run_daily", fake_daily, raising=False)
-
-    assert main(["daily", "--config", str(config_path)]) == 0
-
-    captured = capsys.readouterr()
-    payload = json.loads(captured.out)
-    assert payload == {
-        "growth_count": 1,
-        "mature_count": 0,
-        "run_id": "daily-run",
-        "status": "delivered",
-    }
-    assert captured.out.count("\n") == 1
-    assert "report body" not in captured.out
-    assert captured.err == ""
+def test_daily_command_is_retired_in_favor_of_hybrid(capsys, config_path):
+    assert main(["daily", "--config", str(config_path)]) == 2
+    assert "legacy daily command retired" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio

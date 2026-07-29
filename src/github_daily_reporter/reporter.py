@@ -118,7 +118,12 @@ def send_telegram(message: str, bot_token: str, chat_id: str) -> None:
 
 
 def report(config_path_str: str) -> None:
-    """Full pipeline: collect → save JSON → LLM report → save MD → Telegram."""
+    """Retired compatibility entry point; production uses the hybrid CLI."""
+    raise RuntimeError("legacy reporter.py entry point retired; use cli hybrid")
+
+
+def _legacy_report(config_path_str: str) -> None:
+    """Former implementation retained below only for source compatibility."""
     config_path = Path(config_path_str).expanduser().resolve()
     config = load_config(config_path)
 
@@ -166,7 +171,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="github-daily-reporter")
     parser.add_argument("--config", type=str, default="config/reporter.yaml")
     args = parser.parse_args()
-    report(args.config)
+    try:
+        report(args.config)
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
