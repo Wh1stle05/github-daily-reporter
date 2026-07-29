@@ -5,6 +5,8 @@ import pytest
 
 from github_daily_reporter.editorial import (
     build_editorial_input,
+    prepare_attempt,
+    promote_reports,
     validate_reports,
     write_editorial_artifacts,
 )
@@ -163,3 +165,26 @@ def test_build_editorial_input_marks_partial_when_a_cohort_has_fewer_than_ten(
     envelope = build_editorial_input(candidates, [], tmp_path / "run", now=now)
     assert envelope.status == "partial"
     assert envelope.available_counts["mature"] == 3
+
+
+def test_attempt_isolation_quarantines_stale_reports_and_promotes_atomically(tmp_path):
+    run_dir = tmp_path / "github-daily-report-2026-07-29"
+    run_dir.mkdir(parents=True)
+    (run_dir / "growth-report.md").write_text("stale", encoding="utf-8")
+    (run_dir / "mature-report.md").write_text("stale", encoding="utf-8")
+    attempt_dir = prepare_attempt(run_dir, "attempt-2")
+    assert not (run_dir / "growth-report.md").exists()
+    assert list((attempt_dir / "stale").glob("*.md"))
+
+    handoff = _input()
+    (attempt_dir / "growth-report.md").write_text(
+        "# GitHub 成长项目榜 · 2026-07-29\n\n### 1. a/growth\nhttps://github.com/a/growth\n- 综合评分：82.4/100\n",
+        encoding="utf-8",
+    )
+    (attempt_dir / "mature-report.md").write_text(
+        "# GitHub 万星增量榜 · 2026-07-29\n\n### 1. a/mature\nhttps://github.com/a/mature\n- 综合评分：82.4/100\n",
+        encoding="utf-8",
+    )
+    promote_reports(run_dir, handoff, "attempt-2")
+    assert (run_dir / "growth-report.md").read_text(encoding="utf-8").startswith("# GitHub")
+    assert (run_dir / "mature-report.md").is_file()

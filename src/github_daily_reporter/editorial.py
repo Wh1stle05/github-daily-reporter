@@ -133,6 +133,49 @@ def write_editorial_artifacts(
     return attempt_dir or run_dir
 
 
+def prepare_attempt(run_dir: Path, attempt_id: str) -> Path:
+    """Create an isolated attempt and move any canonical reports out of the way."""
+    attempt_dir = run_dir / "attempts" / _safe_filename(attempt_id)
+    stale_dir = attempt_dir / "stale"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("growth-report.md", "mature-report.md"):
+        canonical = run_dir / name
+        if canonical.exists():
+            canonical.replace(stale_dir / name)
+    return attempt_dir
+
+
+def promote_reports(
+    run_dir: Path,
+    handoff: EditorialInput | Mapping[str, Any],
+    attempt_id: str,
+) -> dict[str, list[str]]:
+    """Validate an attempt and atomically promote both report files."""
+    attempt_dir = run_dir / "attempts" / _safe_filename(attempt_id)
+    growth_path = attempt_dir / "growth-report.md"
+    mature_path = attempt_dir / "mature-report.md"
+    try:
+        growth = growth_path.read_text(encoding="utf-8")
+        mature = mature_path.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise ValueError("Agent report is missing") from error
+    selected = validate_reports(run_dir, handoff, growth, mature)
+    for source, target in ((growth_path, run_dir / "growth-report.md"), (mature_path, run_dir / "mature-report.md")):
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        temporary.replace(target)
+    status_path = run_dir / "run-status.json"
+    status: dict[str, Any] = {}
+    if status_path.exists():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            status = {}
+    status.update({"status": "validated", "attempt_id": attempt_id, "reports": {"growth": True, "mature": True}})
+    _atomic_json(status_path, status)
+    return selected
+
+
 def validate_reports(
     run_dir: Path,
     handoff: EditorialInput | Mapping[str, Any],
@@ -183,6 +226,8 @@ def _validate_one_report(
 ) -> list[str]:
     if not text.strip():
         raise ValueError(f"{expected_cohort} report is empty")
+    if _utf16_units(text) > 4096:
+        raise ValueError(f"{expected_cohort} report exceeds Telegram UTF-16 limit")
     first_line = text.lstrip().splitlines()[0].strip()
     if first_line != expected_title:
         raise ValueError(f"wrong {expected_cohort} title")
@@ -317,6 +362,10 @@ def _bounded_text(value: str, max_bytes: int) -> str:
 
 def _safe_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:160] or "item"
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
 
 
 def _as_utc(value: datetime) -> datetime:
