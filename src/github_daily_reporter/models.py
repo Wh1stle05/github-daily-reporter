@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, Field, computed_field
 
 SourceName = Literal["trending", "github_search", "hacker_news"]
 RunStatus = Literal["running", "success", "partial", "failed"]
@@ -85,41 +85,6 @@ class RepositoryCandidate(BaseModel):
         return len(self.discovery_sources)
 
 
-class QualityReview(BaseModel):
-    canonical_name: str
-    usefulness: int = Field(ge=0, le=5)
-    completeness: int = Field(ge=0, le=5)
-    novelty: int = Field(ge=0, le=5)
-    maintenance: int = Field(ge=0, le=5)
-    exclude: bool = False
-    exclude_reason: str | None = None
-    duplicate_of: str | None = None
-
-
-class QualityEnvelope(BaseModel):
-    run_id: str
-    reviews: list[QualityReview]
-
-
-class LlmReview(BaseModel):
-    canonical_name: str
-    quality_score: int = Field(strict=True, ge=0, le=100)
-    exclude: bool = False
-    exclude_reason: str | None = None
-    summary_zh: str = Field(max_length=160)
-    highlight_zh: str = Field(max_length=240)
-
-    @model_validator(mode="after")
-    def validate_exclusion_reason(self) -> "LlmReview":
-        if self.exclude and not (self.exclude_reason or "").strip():
-            raise ValueError("exclude_reason is required when exclude is true")
-        return self
-
-
-class LlmReviewEnvelope(BaseModel):
-    reviews: list[LlmReview]
-
-
 class ScoreBreakdown(BaseModel):
     momentum: float
     evidence: float
@@ -191,18 +156,6 @@ class RankedCandidate(BaseModel):
     quality_degraded: bool = False
 
 
-class DailyRunResult(BaseModel):
-    run_id: str
-    status: Literal[
-        "delivered", "delivery_pending", "collection_failed", "llm_failed"
-    ]
-    growth: list[RankedCandidate] = Field(default_factory=list)
-    mature: list[RankedCandidate] = Field(default_factory=list)
-    markdown: str | None = None
-    source_health: list[SourceHealth] = Field(default_factory=list)
-    error_category: str | None = None
-
-
 class DeliveryPart(BaseModel):
     run_id: str
     part_index: int = Field(ge=0)
@@ -225,5 +178,4 @@ class CollectionEnvelope(BaseModel):
     generated_at: datetime
     source_health: list[SourceHealth]
     candidates: list[RepositoryCandidate]
-    quality_review_path: str | None = None
     fatal_error: str | None = None

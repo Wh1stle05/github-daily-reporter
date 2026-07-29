@@ -6,9 +6,6 @@ import pytest
 
 from github_daily_reporter.models import (
     DeliveryPart,
-    QualityReview,
-    RankedCandidate,
-    ScoreBreakdown,
     SourceObservation,
 )
 from github_daily_reporter.state import StateStore
@@ -24,21 +21,6 @@ def candidate(name: str = "owner/repo", stars_total: int = 100):
         created_at=datetime.now(UTC),
         stars_total=stars_total,
         discovery_sources={"trending"},
-    )
-
-
-def ranked_candidate(name: str = "owner/repo", score: float = 42.0):
-    return RankedCandidate(
-        candidate=candidate(name),
-        score=ScoreBreakdown(
-            momentum=1.0,
-            evidence=2.0,
-            freshness=3.0,
-            hacker_news=4.0,
-            quality=5.0,
-            popularity=6.0,
-            final=score,
-        ),
     )
 
 
@@ -140,72 +122,6 @@ def test_estimate_stars_24h_uses_inclusive_window_boundaries_and_cutoff_target(t
     ) == (80, earliest)
 
 
-def test_save_ranking_persists_excluded_review_without_ranked_candidate(tmp_path):
-    store = StateStore(tmp_path / "state.sqlite3")
-    run_id = store.start_run(datetime.now(UTC))
-    review = QualityReview(
-        canonical_name="review-only/repo",
-        usefulness=1,
-        completeness=2,
-        novelty=3,
-        maintenance=4,
-        exclude=True,
-        exclude_reason="duplicate",
-    )
-
-    store.save_ranking(run_id, [], [review])
-
-    with sqlite3.connect(store.path) as connection:
-        row = connection.execute(
-            "SELECT review_json, score_json, excluded FROM ranking_decisions "
-            "WHERE run_id = ? AND canonical_name = ?",
-            (run_id, review.canonical_name),
-        ).fetchone()
-
-    assert row == (review.model_dump_json(), "{}", 1)
-
-
-def test_save_ranking_persists_ranked_candidate_without_review(tmp_path):
-    store = StateStore(tmp_path / "state.sqlite3")
-    run_id = store.start_run(datetime.now(UTC))
-    ranked = ranked_candidate("ranked-only/repo")
-
-    store.save_ranking(run_id, [ranked], [])
-
-    with sqlite3.connect(store.path) as connection:
-        row = connection.execute(
-            "SELECT review_json, score_json, excluded FROM ranking_decisions "
-            "WHERE run_id = ? AND canonical_name = ?",
-            (run_id, ranked.candidate.canonical_name),
-        ).fetchone()
-
-    assert row == ("{}", ranked.score.model_dump_json(), 0)
-
-
-def test_save_ranking_persists_actual_review_and_score_for_ranked_review(tmp_path):
-    store = StateStore(tmp_path / "state.sqlite3")
-    run_id = store.start_run(datetime.now(UTC))
-    ranked = ranked_candidate("ranked-and-reviewed/repo")
-    review = QualityReview(
-        canonical_name=ranked.candidate.canonical_name,
-        usefulness=1,
-        completeness=2,
-        novelty=3,
-        maintenance=4,
-    )
-
-    store.save_ranking(run_id, [ranked], [review])
-
-    with sqlite3.connect(store.path) as connection:
-        row = connection.execute(
-            "SELECT review_json, score_json, excluded FROM ranking_decisions "
-            "WHERE run_id = ? AND canonical_name = ?",
-            (run_id, ranked.candidate.canonical_name),
-        ).fetchone()
-
-    assert row == (review.model_dump_json(), ranked.score.model_dump_json(), 0)
-
-
 def test_initialization_creates_required_tables(tmp_path):
     path = tmp_path / "state.sqlite3"
     StateStore(path)
@@ -229,48 +145,6 @@ def test_initialization_creates_required_tables(tmp_path):
         "report_artifacts",
         "delivery_parts",
     } <= tables
-
-
-def test_save_report_artifacts_persists_all_payloads_and_timestamp(tmp_path):
-    store = StateStore(tmp_path / "state.sqlite3")
-
-    store.save_report_artifacts("run-1", "source", "review", "ranking", "# Report")
-
-    with sqlite3.connect(store.path) as connection:
-        row = connection.execute(
-            "SELECT source_json, review_json, ranking_json, markdown, created_at, updated_at "
-            "FROM report_artifacts WHERE run_id = ?",
-            ("run-1",),
-        ).fetchone()
-    assert row[:4] == ("source", "review", "ranking", "# Report")
-    assert row[4] == row[5]
-
-
-def test_save_report_artifacts_and_enqueue_delivery_rolls_back_everything_on_enqueue_failure(tmp_path):
-    store = StateStore(tmp_path / "state.sqlite3")
-    with sqlite3.connect(store.path) as connection:
-        connection.execute(
-            "CREATE TRIGGER fail_second_transactional_delivery_part "
-            "BEFORE INSERT ON delivery_parts WHEN NEW.part_index = 1 "
-            "BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
-        )
-
-    with pytest.raises(sqlite3.IntegrityError, match="injected failure"):
-        store.save_report_artifacts_and_enqueue_delivery(
-            "run-1",
-            "source",
-            "review",
-            "ranking",
-            "# Report",
-            [(0, "first"), (1, "second")],
-        )
-
-    with sqlite3.connect(store.path) as connection:
-        artifacts = connection.execute(
-            "SELECT 1 FROM report_artifacts WHERE run_id = ?", ("run-1",)
-        ).fetchall()
-    assert artifacts == []
-    assert store.pending_deliveries("run-1") == []
 
 
 def test_delivery_part_round_trip(tmp_path):

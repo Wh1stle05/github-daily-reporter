@@ -4,7 +4,6 @@ from math import log
 import pytest
 
 from github_daily_reporter.scoring import (
-    momentum_signal,
     normalize_elapsed_velocity,
     rank_candidates,
     score_candidate,
@@ -119,16 +118,6 @@ def test_activity_uses_reactivation_push_timestamp(candidate_factory):
         0,
     )
     assert score.freshness == 100
-
-
-def test_momentum_signal_tracks_provenance_and_discounts_estimates(candidate_factory):
-    exact, exact_source = momentum_signal(candidate_factory(stars_24h=100))
-    estimate, estimate_source = momentum_signal(
-        candidate_factory(stars_24h=100, stars_24h_estimated=True)
-    )
-    assert exact_source == "exact"
-    assert estimate_source == "snapshot_estimate"
-    assert exact > estimate > 0
 
 
 def test_mature_quality_does_not_change_numeric_score(candidate_factory):

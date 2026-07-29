@@ -85,9 +85,7 @@ def ranking_key(item: RankedCandidate) -> tuple[float | bool | int | str, ...]:
     )
 
 
-def momentum_signal(candidate: RepositoryCandidate) -> tuple[float, MomentumSource]:
-    """Return the legacy-compatible momentum value and trusted provenance."""
-    return _absolute_momentum_signal(candidate)
+
 
 
 def score_growth_candidate(
@@ -294,9 +292,7 @@ def _round_final(value: float) -> float:
     return round(_clamp(value), 1)
 
 
-def _round_score(value: float) -> float:
-    """Legacy alias retained for imports from older integrations."""
-    return _round_component(value)
+
 
 
 def _as_utc(value: datetime) -> datetime:

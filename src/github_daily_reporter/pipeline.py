@@ -28,7 +28,6 @@ from github_daily_reporter.models import (
 )
 from github_daily_reporter.normalize import merge_observations
 from github_daily_reporter.quality import deterministic_exclusion
-from github_daily_reporter.scoring import rank_candidates
 from github_daily_reporter.state import StateStore
 
 
@@ -80,7 +79,6 @@ class CollectionPipeline:
                 generated_at=observed_at,
                 source_health=[],
                 candidates=[],
-                quality_review_path=self._quality_review_path(run_id),
                 fatal_error="collection already in progress",
             )
         try:
@@ -110,14 +108,8 @@ class CollectionPipeline:
 
             self.store.save_collection_transaction(run_id, eligible, observations, now)
 
-            ranked = rank_candidates(((candidate, 50.0, True) for candidate in eligible), now)
-            bounded = self._bound_output_candidates(
-                [item.candidate for item in ranked[: self.config.max_llm_candidates]]
-            )
-            self._write_candidates(run_id, bounded)
+            bounded = self._bound_output_candidates(eligible[: self.config.max_llm_candidates])
 
-            # The UUID-backed legacy artifact remains for compatibility; the
-            # active hybrid handoff is date-addressable and contains both pools.
             date_run_dir = self._date_run_dir(now)
             editorial = build_editorial_input(eligible, source_health, date_run_dir, now=now)
             write_editorial_artifacts(editorial, date_run_dir)
@@ -130,7 +122,6 @@ class CollectionPipeline:
                 generated_at=now,
                 source_health=source_health,
                 candidates=bounded,
-                quality_review_path=self._quality_review_path(run_id),
             )
         except Exception:
             LOGGER.exception("collection pipeline failed")
@@ -141,7 +132,6 @@ class CollectionPipeline:
                 generated_at=now,
                 source_health=source_health,
                 candidates=[],
-                quality_review_path=self._quality_review_path(run_id),
                 fatal_error="collection pipeline failed",
             )
 
@@ -301,25 +291,9 @@ class CollectionPipeline:
             web, now, self.config.hn_lookback_hours, self.config.max_candidates_per_source
         )
 
-    def _run_dir(self, run_id: str) -> Path:
-        project_root = self.config.project_root or self.config.state_db.parent.parent
-        return project_root / "data" / "runs" / run_id
-
     def _date_run_dir(self, now: datetime) -> Path:
         project_root = self.config.project_root or self.config.state_db.parent.parent
         return project_root / "data" / "runs" / f"github-daily-report-{now.date().isoformat()}"
-
-    @staticmethod
-    def _quality_review_path(run_id: str) -> str:
-        return f"data/runs/{run_id}/quality-review.json"
-
-    def _write_candidates(self, run_id: str, candidates: list[RepositoryCandidate]) -> None:
-        run_dir = self._run_dir(run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        output = run_dir / "candidates.json"
-        temporary = output.with_suffix(".json.tmp")
-        temporary.write_text(serialize_candidates(candidates), encoding="utf-8")
-        temporary.replace(output)
 
     def _failed_envelope(
         self, run_id: str, now: datetime, source_health: list[SourceHealth], error: str
@@ -331,7 +305,6 @@ class CollectionPipeline:
             generated_at=now,
             source_health=source_health,
             candidates=[],
-            quality_review_path=self._quality_review_path(run_id),
             fatal_error=error,
         )
 

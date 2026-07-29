@@ -8,8 +8,6 @@ from uuid import uuid4
 
 from github_daily_reporter.models import (
     DeliveryPart,
-    QualityReview,
-    RankedCandidate,
     RepositoryCandidate,
     SourceHealth,
     SourceObservation,
@@ -333,130 +331,6 @@ class StateStore:
         if observed >= now_utc or current_stars < stars_total:
             return None
         return current_stars - stars_total, observed
-
-    def save_ranking(
-        self,
-        run_id: str,
-        ranked: list[RankedCandidate],
-        reviews: list[QualityReview],
-        excluded_reasons: dict[str, str] | None = None,
-        deterministic_exclusions: dict[str, str] | None = None,
-    ) -> None:
-        """Persist every rank or exclusion decision for a collection run."""
-        ranked_by_name = {item.candidate.canonical_name: item for item in ranked}
-        reviews_by_name = {review.canonical_name: review for review in reviews}
-        deterministic_exclusions = deterministic_exclusions or {}
-        excluded_reasons = {
-            review.canonical_name: review.exclude_reason or "llm_exclusion"
-            for review in reviews
-            if review.exclude
-        } | (excluded_reasons or {})
-        with self._connection() as connection:
-            for canonical_name in sorted(
-                ranked_by_name.keys() | reviews_by_name.keys() | excluded_reasons.keys()
-            ):
-                item = ranked_by_name.get(canonical_name)
-                review = reviews_by_name.get(canonical_name)
-                review_json = (
-                    json.dumps(
-                        {
-                            "review": review.model_dump(mode="json"),
-                            "deterministic_exclusion": deterministic_exclusions[canonical_name],
-                        },
-                        separators=(",", ":"),
-                    )
-                    if review is not None and canonical_name in deterministic_exclusions
-                    else review.model_dump_json()
-                    if review is not None
-                    else json.dumps(
-                        {"deterministic_exclusion": excluded_reasons[canonical_name]},
-                        separators=(",", ":"),
-                    )
-                    if canonical_name in excluded_reasons
-                    else "{}"
-                )
-                connection.execute(
-                    "INSERT INTO ranking_decisions "
-                    "(run_id, canonical_name, review_json, score_json, excluded) VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(run_id, canonical_name) DO UPDATE SET "
-                    "review_json = excluded.review_json, score_json = excluded.score_json, "
-                    "excluded = excluded.excluded",
-                    (
-                        run_id,
-                        canonical_name,
-                        review_json,
-                        item.score.model_dump_json() if item is not None else "{}",
-                        int(canonical_name in excluded_reasons or canonical_name in deterministic_exclusions),
-                    ),
-                )
-
-    def save_report_artifacts(
-        self,
-        run_id: str,
-        source_json: str,
-        review_json: str,
-        ranking_json: str,
-        markdown: str,
-        created_at: datetime | None = None,
-    ) -> None:
-        """Atomically persist the rendered report and its source artifacts."""
-        timestamp = _timestamp(created_at or datetime.now(UTC))
-        with self._connection() as connection:
-            self._save_report_artifacts(
-                connection,
-                run_id,
-                source_json,
-                review_json,
-                ranking_json,
-                markdown,
-                timestamp,
-            )
-
-    def save_report_artifacts_and_enqueue_delivery(
-        self,
-        run_id: str,
-        source_json: str,
-        review_json: str,
-        ranking_json: str,
-        markdown: str,
-        parts: Iterable[tuple[int, str]],
-        created_at: datetime | None = None,
-    ) -> None:
-        """Persist a successful report and every delivery part in one transaction."""
-        prepared = self._prepare_delivery_parts(parts)
-        timestamp = _timestamp(created_at or datetime.now(UTC))
-        with self._connection() as connection:
-            self._save_report_artifacts(
-                connection,
-                run_id,
-                source_json,
-                review_json,
-                ranking_json,
-                markdown,
-                timestamp,
-            )
-            self._enqueue_delivery_parts(connection, run_id, prepared, timestamp)
-
-    @staticmethod
-    def _save_report_artifacts(
-        connection: sqlite3.Connection,
-        run_id: str,
-        source_json: str,
-        review_json: str,
-        ranking_json: str,
-        markdown: str,
-        timestamp: str,
-    ) -> None:
-        connection.execute(
-            "INSERT INTO report_artifacts "
-            "(run_id, source_json, review_json, ranking_json, markdown, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(run_id) DO UPDATE SET "
-            "source_json = excluded.source_json, review_json = excluded.review_json, "
-            "ranking_json = excluded.ranking_json, markdown = excluded.markdown, "
-            "updated_at = excluded.updated_at",
-            (run_id, source_json, review_json, ranking_json, markdown, timestamp, timestamp),
-        )
 
     def enqueue_delivery(
         self,

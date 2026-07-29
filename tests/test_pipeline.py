@@ -225,10 +225,8 @@ async def test_output_is_capped_to_llm_candidate_limit(pipeline_factory):
     envelope = await pipeline.collect()
     assert len(envelope.candidates) == 40
     assert len(json.dumps(envelope.model_dump(mode="json"))) < 200_000
-
-
 @pytest.mark.asyncio
-async def test_worst_case_candidate_text_keeps_returned_and_persisted_payloads_below_budget(pipeline_factory):
+async def test_worst_case_candidate_text_keeps_returned_payloads_below_budget(pipeline_factory):
     pipeline, _, _ = pipeline_factory(
         candidate_count=80,
         max_llm_candidates=40,
@@ -237,9 +235,7 @@ async def test_worst_case_candidate_text_keeps_returned_and_persisted_payloads_b
     )
     envelope = await pipeline.collect()
     returned = json.dumps(envelope.model_dump(mode="json"), ensure_ascii=False).encode("utf-8")
-    persisted = (pipeline._run_dir(envelope.run_id) / "candidates.json").read_bytes()
     assert len(returned) < 200_000
-    assert len(persisted) < 200_000
 
 
 @pytest.mark.asyncio
@@ -252,28 +248,25 @@ async def test_non_ascii_payload_uses_the_same_compact_utf8_encoding_within_budg
     )
     envelope = await pipeline.collect()
     returned = serialize_collection_envelope(envelope).encode("utf-8")
-    persisted = (pipeline._run_dir(envelope.run_id) / "candidates.json").read_bytes()
     assert len(returned) < 200_000
-    assert len(persisted) < 200_000
 
 
 @pytest.mark.asyncio
-async def test_quality_review_path_is_relative_while_candidates_use_configured_data_dir(pipeline_factory):
+async def test_editorial_handoff_is_written_for_each_collection(pipeline_factory):
     pipeline, _, _ = pipeline_factory()
     envelope = await pipeline.collect()
-    assert envelope.quality_review_path == f"data/runs/{envelope.run_id}/quality-review.json"
-    assert (pipeline.config.state_db.parent / "runs" / envelope.run_id / "candidates.json").is_file()
+    project_root = pipeline.config.project_root or pipeline.config.state_db.parent.parent
+    run_dir = project_root / "data" / "runs" / f"github-daily-report-{envelope.generated_at.date().isoformat()}"
+    assert (run_dir / "editorial-input.json").is_file()
 
 
 @pytest.mark.asyncio
-async def test_candidates_use_project_data_directory_when_state_db_is_elsewhere(pipeline_factory, tmp_path):
+async def test_candidates_are_available_in_collection_envelope(pipeline_factory, tmp_path):
     pipeline, _, _ = pipeline_factory(
-        state_db=tmp_path / "external-state" / "reporter.sqlite3",
         project_root=tmp_path,
     )
     envelope = await pipeline.collect()
-    assert (tmp_path / "data" / "runs" / envelope.run_id / "candidates.json").is_file()
-    assert not (tmp_path / "external-state" / "runs" / envelope.run_id / "candidates.json").exists()
+    assert len(envelope.candidates) > 0
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,5 @@
-import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import io
 import json
 from pathlib import Path
 from typing import Any
@@ -9,11 +7,9 @@ from typing import Any
 import httpx
 import pytest
 
-from github_daily_reporter.cli import main
 from github_daily_reporter.config import load_config
 from github_daily_reporter.github_client import GitHubClient
-from github_daily_reporter.models import RepositoryCandidate
-from github_daily_reporter.models import CollectionEnvelope, RankedCandidate
+from github_daily_reporter.models import RepositoryCandidate, CollectionEnvelope
 from github_daily_reporter.pipeline import CollectionPipeline
 from github_daily_reporter.state import StateStore
 
@@ -56,14 +52,8 @@ def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return path
 
 
-@dataclass
-class RankedRun:
-    run_id: str
-    ranked: list[RankedCandidate]
-
-
 class EndToEndHarness:
-    """Runs real reporter components against recorded HTTP responses."""
+    """Runs real reporter collection components against recorded HTTP responses."""
 
     def __init__(self, root: Path, respx_mock: Any) -> None:
         self.root = root
@@ -100,34 +90,6 @@ class EndToEndHarness:
             return await CollectionPipeline(config, store, github, web).collect(
                 datetime(2026, 7, 24, 12, tzinfo=UTC)
             )
-
-    async def collect_and_rank(self) -> RankedRun:
-        collected = await self.collect()
-        return await self.rank_existing_run(collected.run_id)
-
-    async def rank_existing_run(self, run_id: str) -> RankedRun:
-        review = json.loads((self.fixture_root / "quality_review.json").read_text(encoding="utf-8"))
-        review["run_id"] = run_id
-        quality_path = self.root / "data" / "runs" / run_id / "quality-review.json"
-        quality_path.write_text(json.dumps(review), encoding="utf-8")
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
-            assert main(
-                [
-                    "rank",
-                    "--config",
-                    str(self.config_path),
-                    "--run-id",
-                    run_id,
-                    "--quality-file",
-                    str(quality_path),
-                ]
-            ) == 0
-        payload = json.loads(stdout.getvalue())
-        return RankedRun(
-            run_id=run_id,
-            ranked=[RankedCandidate.model_validate(item) for item in payload["ranked"]],
-        )
 
     def _install_responses(self, failing_sources: set[str], graphql_failure: bool) -> None:
         self.respx_mock.clear()
