@@ -61,9 +61,15 @@ https://github.com/owner/repo
 - 看点：基于可验证事实说明完成度和入选原因
 ```
 
-Use the mature title for the second file. Keep each entry concise and add at
-most two short observation bullets after the entries. Do not add a global
-introduction, tables, fabricated facts, or an explanatory essay.
+The first line of the mature report must be exactly:
+
+```markdown
+# GitHub 万星增量榜 · YYYY-MM-DD
+```
+
+Keep each entry concise and add at most two short observation bullets after
+the entries. Do not add a global introduction, tables, fabricated facts, or
+an explanatory essay.
 
 Do not call collection, rank, quality-review, Telegram, or arbitrary scripts.
 Do not send messages. Do not repair a failed output by looping. After both

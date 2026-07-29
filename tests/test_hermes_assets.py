@@ -22,3 +22,9 @@ def test_hybrid_skill_source_exists_with_required_frontmatter():
     assert text.startswith("---\n")
     assert "name: github-daily-reporter" in text
     assert "description:" in text
+
+
+def test_hybrid_skill_requires_validator_report_titles():
+    text = (ROOT / "skills/github-daily-reporter/SKILL.md").read_text(encoding="utf-8")
+    assert "# GitHub 成长项目榜 · YYYY-MM-DD" in text
+    assert "# GitHub 万星增量榜 · YYYY-MM-DD" in text
