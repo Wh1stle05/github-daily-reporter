@@ -6,7 +6,6 @@ from github_daily_reporter.config import ReporterConfig, load_config
 
 
 DIRECT_RUNTIME_SECRETS = {
-    "llm_api_key": "llm-secret",
     "telegram_bot_token": "bot-secret",
     "telegram_chat_id": "123456",
 }
@@ -31,7 +30,6 @@ def test_load_config_resolves_state_db_and_secret(
         encoding="utf-8",
     )
     monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
-    monkeypatch.setenv("LLM_API_KEY", "llm-secret")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-secret")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "123456")
 
@@ -40,10 +38,8 @@ def test_load_config_resolves_state_db_and_secret(
     assert config.timezone == "Asia/Shanghai"
     assert config.state_db == tmp_path / "data/reporter.sqlite3"
     assert config.github_token.get_secret_value() == "secret-token"
-    assert config.llm_api_key.get_secret_value() == "llm-secret"
     assert config.telegram_bot_token.get_secret_value() == "bot-secret"
     assert config.telegram_chat_id == "123456"
-    assert config.llm_model == "gpt-4.1-mini"
     assert config.growth_report_items == 10
     assert config.mature_report_items == 10
 
@@ -56,7 +52,6 @@ def test_load_config_ignores_runtime_secrets_from_yaml(
         "\n".join(
             (
                 "timezone: UTC",
-                "llm_api_key: yaml-llm-secret",
                 "telegram_bot_token: yaml-bot-secret",
                 "telegram_chat_id: yaml-chat-id",
             )
@@ -64,17 +59,14 @@ def test_load_config_ignores_runtime_secrets_from_yaml(
         encoding="utf-8",
     )
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
-    monkeypatch.setenv("LLM_API_KEY", "env-llm-secret")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-bot-secret")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "env-chat-id")
 
     config = load_config(config_path)
 
-    assert config.llm_api_key.get_secret_value() == "env-llm-secret"
     assert config.telegram_bot_token.get_secret_value() == "env-bot-secret"
     assert config.telegram_chat_id == "env-chat-id"
     serialized = config.model_dump()
-    assert "llm_api_key" not in serialized
     assert "telegram_bot_token" not in serialized
     assert "telegram_chat_id" not in serialized
 

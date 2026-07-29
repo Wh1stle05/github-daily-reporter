@@ -10,10 +10,6 @@ from pydantic import BaseModel, Field, SecretStr, model_validator
 class ReporterConfig(BaseModel):
     timezone: str
     github_token: SecretStr
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4.1-mini"
-    llm_api_key: SecretStr = Field(default=SecretStr(""), exclude=True, repr=False)
-    llm_timeout_seconds: float = Field(default=45, gt=0, le=120)
     hermes_timeout_seconds: float = Field(default=900, gt=0, le=900)
     growth_review_candidates: int = Field(default=20, ge=4, le=40)
     mature_review_candidates: int = Field(default=20, ge=2, le=30)
@@ -73,7 +69,6 @@ def load_config(path: Path) -> ReporterConfig:
     load_dotenv(project_root / ".env")
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     raw["github_token"] = os.environ.get("GITHUB_TOKEN", "")
-    raw["llm_api_key"] = os.environ.get("LLM_API_KEY", "")
     raw["telegram_bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     raw["telegram_chat_id"] = os.environ.get("TELEGRAM_CHAT_ID", "")
     raw["state_db"] = (
