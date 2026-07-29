@@ -14,10 +14,11 @@ class ReporterConfig(BaseModel):
     llm_model: str = "gpt-4.1-mini"
     llm_api_key: SecretStr = Field(default=SecretStr(""), exclude=True, repr=False)
     llm_timeout_seconds: float = Field(default=45, gt=0, le=120)
+    hermes_timeout_seconds: float = Field(default=900, gt=0, le=900)
     growth_review_candidates: int = Field(default=20, ge=4, le=40)
-    mature_review_candidates: int = Field(default=12, ge=2, le=30)
-    growth_report_items: int = Field(default=6, ge=1, le=10)
-    mature_report_items: int = Field(default=4, ge=1, le=10)
+    mature_review_candidates: int = Field(default=20, ge=2, le=30)
+    growth_report_items: int = Field(default=10, ge=1, le=10)
+    mature_report_items: int = Field(default=10, ge=1, le=10)
     telegram_bot_token: SecretStr = Field(
         default=SecretStr(""), exclude=True, repr=False
     )
@@ -48,8 +49,6 @@ class ReporterConfig(BaseModel):
             raise ValueError("timezone must be a valid IANA timezone") from exc
         if self.max_report_items > self.max_llm_candidates:
             raise ValueError("max_report_items cannot exceed max_llm_candidates")
-        if self.growth_report_items + self.mature_report_items > 10:
-            raise ValueError("total report items cannot exceed 10")
         if self.growth_review_candidates < self.growth_report_items:
             raise ValueError(
                 "growth_review_candidates cannot be below growth_report_items"

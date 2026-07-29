@@ -6,8 +6,4 @@ cd "$PROJECT_ROOT"
 
 export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-export LLM_API_KEY="${LLM_API_KEY:-}"
-export LLM_MODEL="${LLM_MODEL:-deepseek-v4-flash}"
-export LLM_BASE_URL="${LLM_BASE_URL:-https://api.deepseek.com}"
-
-exec .venv/bin/python -m github_daily_reporter.reporter --config config/reporter.yaml
+exec .venv/bin/python -m github_daily_reporter.cli hybrid --config config/reporter.yaml

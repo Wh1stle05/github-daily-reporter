@@ -44,8 +44,8 @@ def test_load_config_resolves_state_db_and_secret(
     assert config.telegram_bot_token.get_secret_value() == "bot-secret"
     assert config.telegram_chat_id == "123456"
     assert config.llm_model == "gpt-4.1-mini"
-    assert config.growth_report_items == 6
-    assert config.mature_report_items == 4
+    assert config.growth_report_items == 10
+    assert config.mature_report_items == 10
 
 
 def test_load_config_ignores_runtime_secrets_from_yaml(
@@ -92,9 +92,13 @@ def test_config_rejects_report_limit_above_llm_limit() -> None:
         )
 
 
-def test_config_rejects_more_than_ten_total_report_items() -> None:
-    with pytest.raises(ValueError, match="report items cannot exceed 10"):
-        reporter_config(growth_report_items=7, mature_report_items=4)
+def test_config_allows_ten_items_per_cohort() -> None:
+    ReporterConfig(
+        timezone="UTC",
+        github_token="token",
+        growth_report_items=10,
+        mature_report_items=10,
+    )
 
 
 @pytest.mark.parametrize(

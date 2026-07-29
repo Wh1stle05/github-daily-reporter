@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from github_daily_reporter.config import ReporterConfig, load_config
 from github_daily_reporter.daily import DailyReporter
 from github_daily_reporter.github_client import GitHubClient
+from github_daily_reporter.hybrid import run_hybrid as run_hybrid_pipeline
 from github_daily_reporter.llm import LlmReviewClient
 from github_daily_reporter.models import (
     CollectionEnvelope,
@@ -54,6 +55,9 @@ def _parser() -> argparse.ArgumentParser:
 
     daily = subparsers.add_parser("daily")
     daily.add_argument("--config", type=Path, required=True)
+
+    hybrid = subparsers.add_parser("hybrid")
+    hybrid.add_argument("--config", type=Path, required=True)
 
     rank = subparsers.add_parser("rank")
     rank.add_argument("--config", type=Path, required=True)
@@ -121,6 +125,18 @@ def main(argv: list[str] | None = None) -> int:
                 operational["error_category"] = result.error_category
             print(json.dumps(operational, sort_keys=True))
             return 0
+        if args.command == "hybrid":
+            result = asyncio.run(run_hybrid_pipeline(args.config))
+            operational = {
+                "run_id": result.run_id,
+                "status": result.status,
+                "growth_count": result.growth_count,
+                "mature_count": result.mature_count,
+            }
+            if result.error_category is not None:
+                operational["error_category"] = result.error_category
+            print(json.dumps(operational, sort_keys=True))
+            return 0 if result.status not in {"failed", "delivery_pending"} else 1
         if args.command == "rank":
             _rank(args.config, args.run_id, args.quality_file)
             return 0
